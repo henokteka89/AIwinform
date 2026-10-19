@@ -2278,7 +2278,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 .EXAMPLE
     .\SQLServer-Operations.ps1 -SqlInstances 'SQLPROD01\INST1' -OutputFolder 'D:\Reports' -EnableMetricHistory $true -TimestampedFileName
-#>
+#
 [CmdletBinding()]
 param(
     # ---------------- SQL Server endpoints and instance identification ----------------
@@ -2467,7 +2467,6 @@ function Get-ReportNodeLabel {
     param([string] $SqlInstance)
     if ($script:NodeMap.ContainsKey($SqlInstance)) { return $script:NodeMap[$SqlInstance] }
     return $SqlInstance
-}
 
 function Invoke-DbQuery {
     <# Executes a read-only monitoring query and returns PSCustomObjects tagged with SqlNode. #>
