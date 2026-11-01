@@ -1,0 +1,23 @@
+# creates alauncher for a ps script. Run it once in an elevated PowerShell
+# For instance, SqlPatchGui is the PS that will be launched. 
+
+$dir = 'C:\Apps\PatchAutomation'  # the directory where the launcher will be place
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+# Optional: copy the script in from wherever you saved it, and unblock it (downloaded files are flagged)
+# Copy-Item "$env:USERPROFILE\Downloads\SqlPatchGui.ps1" $dir -Force
+Get-ChildItem $dir -Filter *.ps1 | Unblock-File
+ 
+@'
+@echo off
+rem Starts SqlPatchGui.ps1 (same folder) elevated, with no console window behind it.
+set "PS1=%~dp0SqlPatchGui.ps1"
+if not exist "%PS1%" (
+  echo SqlPatchGui.ps1 not found in %~dp0
+  pause
+  exit /b 1
+)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-STA','-WindowStyle','Hidden','-File',('\"' + $env:PS1 + '\"'))"
+'@ | Set-Content -Path "$dir\Start-SqlPatchGui.cmd" -Encoding ASCII #change the PS script name here 
+
+Get-ChildItem $dir
