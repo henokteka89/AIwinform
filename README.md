@@ -13,6 +13,7 @@ A set of standalone PowerShell tools for SQL Server administration. Each tool li
 | [PITR-RestoreBuilder](PITR-RestoreBuilder/) | Point-in-time restore builder: picks the FULL/DIFF/LOG chain from msdb, preflights the destination, generates the restore script and a SQL Agent job. **Test before production use** | No by default (restore, job, credential and TDE actions only after opt-in and confirmation) |
 | [SQLServer-Operations](SQLServer-Operations/) | Multi-instance operations dashboard (HTML): Always On, backups, capacity, errors, security | No |
 | [SqlBlockingDeadlockMonitor](SqlBlockingDeadlockMonitor/) | Live blocking chains and deadlock analysis, explained in plain English | No |
+| [SqlWaitMonitor](SqlWaitMonitor/) | DPA-style wait monitoring: per-statement wait bars you can drill into, blocking capture, alerts, plain-English story reports. Standalone or many servers through linked servers | **Yes** at install: creates a monitoring database and two SQL Agent jobs (the viewer only reads) |
 | [SqlPatchAutomation](SqlPatchAutomation/) | Patch one SQL Server instance with a CU/GDR: guardrails, staging, install, reboot, validation | **Yes**, it patches SQL Server (admin required) |
 
 ## Getting started
