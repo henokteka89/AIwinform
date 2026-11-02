@@ -10,6 +10,7 @@ A set of standalone PowerShell tools for SQL Server administration. Each tool li
 | [Compare-ExecutionPlans](Compare-ExecutionPlans/) | Compare two or more execution plans, flag the differences, build an AI-ready prompt | No |
 | [LoginSyncReport](LoginSyncReport/) | Login / SID / password / permission drift between AG replicas or migration servers; generates remediation scripts for review | No (scripts are never run) |
 | [MigrationReadiness](MigrationReadiness/) | Readiness check of a new server or DR replica against the current one, with score, action list and prep script | No |
+| [PITR-RestoreBuilder](PITR-RestoreBuilder/) | Point-in-time restore builder: picks the FULL/DIFF/LOG chain from msdb, preflights the destination, generates the restore script and a SQL Agent job. **Test before production use** | No by default (restore, job, credential and TDE actions only after opt-in and confirmation) |
 | [SQLServer-Operations](SQLServer-Operations/) | Multi-instance operations dashboard (HTML): Always On, backups, capacity, errors, security | No |
 | [SqlBlockingDeadlockMonitor](SqlBlockingDeadlockMonitor/) | Live blocking chains and deadlock analysis, explained in plain English | No |
 | [SqlPatchAutomation](SqlPatchAutomation/) | Patch one SQL Server instance with a CU/GDR: guardrails, staging, install, reboot, validation | **Yes**, it patches SQL Server (admin required) |
