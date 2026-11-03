@@ -1724,12 +1724,15 @@ OPTION (MAXDOP 1);
     }
 
     function Get-ProcedureList {
+        <# Procedures, scalar / multi-statement functions and DML triggers: every module that gets its own cached plan. #>
         param([Parameter(Mandatory)]$Context)
         $sql = @"
-SELECT p.object_id AS ObjectId, s.name AS SchemaName, p.name AS ProcName, p.modify_date AS Modified
-FROM sys.procedures AS p JOIN sys.schemas AS s ON s.schema_id = p.schema_id
-WHERE p.is_ms_shipped = 0
-ORDER BY s.name, p.name
+SELECT o.object_id AS ObjectId, s.name AS SchemaName, o.name AS ProcName,
+       CASE o.type WHEN 'P' THEN N'Procedure' WHEN 'FN' THEN N'Scalar function' WHEN 'TF' THEN N'Multi-statement TVF' WHEN 'TR' THEN N'Trigger' ELSE o.type_desc END AS Kind,
+       o.modify_date AS Modified
+FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE o.type IN ('P', 'FN', 'TF', 'TR') AND o.is_ms_shipped = 0
+ORDER BY s.name, o.name
 OPTION (MAXDOP 1);
 "@
         Invoke-SafeQuery -Context $Context -Sql $sql -Label 'procedure list' -TimeoutSec ([math]::Max(60, $Context.CommandTimeoutSec))
@@ -1741,33 +1744,34 @@ OPTION (MAXDOP 1);
         $sql = @"
 SELECT DISTINCT d.referencing_id AS ObjectId
 FROM sys.sql_expression_dependencies AS d
-JOIN sys.procedures AS p ON p.object_id = d.referencing_id
+JOIN sys.objects AS p ON p.object_id = d.referencing_id AND p.type IN ('P', 'FN', 'TF', 'TR')
 WHERE d.referenced_id = @ObjectId
    OR (d.referenced_id IS NULL
-       AND d.referenced_entity_name = OBJECT_NAME(@ObjectId)
-       AND ISNULL(d.referenced_schema_name, OBJECT_SCHEMA_NAME(@ObjectId)) = OBJECT_SCHEMA_NAME(@ObjectId))
+   AND d.referenced_entity_name = OBJECT_NAME(@ObjectId)
+   AND ISNULL(d.referenced_schema_name, OBJECT_SCHEMA_NAME(@ObjectId)) = OBJECT_SCHEMA_NAME(@ObjectId))
 OPTION (MAXDOP 1);
 "@
         @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Sql $sql -Parameters @{ ObjectId = $ObjectId } -Label 'procedures referencing table')) | ForEach-Object { [int]$_.ObjectId }
     }
 
     function Get-ProcedurePlanSources {
-        <# Which plans exist for the procedure: plan cache entries (one per set-options combination) and Query Store. #>
+        <#
+            Which plans exist for the module: plan cache entries (one per set-options combination) from
+            dm_exec_procedure_stats / dm_exec_function_stats (2016+) / dm_exec_trigger_stats, and Query Store.
+        #>
         param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][int]$ObjectId, [Parameter(Mandatory)]$ServerInfo)
         $sources = New-Object System.Collections.Generic.List[object]
         $warnings = New-Object System.Collections.Generic.List[string]
+        $cols = 'plan_handle, cached_time, last_execution_time, execution_count, total_worker_time, total_elapsed_time, total_logical_reads'
+        $parts = @("SELECT $cols FROM sys.dm_exec_procedure_stats WHERE database_id = DB_ID() AND object_id = @ObjectId",
+                   "SELECT $cols FROM sys.dm_exec_trigger_stats WHERE database_id = DB_ID() AND object_id = @ObjectId")
+        if ($ServerInfo.Capabilities.Major -ge 13) { $parts += "SELECT $cols FROM sys.dm_exec_function_stats WHERE database_id = DB_ID() AND object_id = @ObjectId" }
         try {
-            $sql = @"
-SELECT TOP (20) ps.plan_handle AS PlanHandle, ps.cached_time AS CachedTime, ps.last_execution_time AS LastExecution,
-       ps.execution_count AS Executions,
-       CAST(ps.total_worker_time / 1000.0 / NULLIF(ps.execution_count, 0) AS decimal(19,2)) AS AvgCpuMs,
-       CAST(ps.total_elapsed_time / 1000.0 / NULLIF(ps.execution_count, 0) AS decimal(19,2)) AS AvgElapsedMs,
-       CAST(ps.total_logical_reads * 1.0 / NULLIF(ps.execution_count, 0) AS decimal(19,1)) AS AvgLogicalReads
-FROM sys.dm_exec_procedure_stats AS ps
-WHERE ps.database_id = DB_ID() AND ps.object_id = @ObjectId
-ORDER BY ps.last_execution_time DESC
-OPTION (MAXDOP 1);
-"@
+            $sql = "SELECT TOP (20) ps.plan_handle AS PlanHandle, ps.cached_time AS CachedTime, ps.last_execution_time AS LastExecution, ps.execution_count AS Executions,`r`n" +
+                   "       CAST(ps.total_worker_time / 1000.0 / NULLIF(ps.execution_count, 0) AS decimal(19,2)) AS AvgCpuMs,`r`n" +
+                   "       CAST(ps.total_elapsed_time / 1000.0 / NULLIF(ps.execution_count, 0) AS decimal(19,2)) AS AvgElapsedMs,`r`n" +
+                   "       CAST(ps.total_logical_reads * 1.0 / NULLIF(ps.execution_count, 0) AS decimal(19,1)) AS AvgLogicalReads`r`n" +
+                   "FROM (" + ($parts -join "`r`n      UNION ALL ") + ") AS ps`r`nORDER BY ps.last_execution_time DESC`r`nOPTION (MAXDOP 1);"
             foreach ($r in @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Sql $sql -Parameters @{ ObjectId = $ObjectId } -Label 'cached plans of procedure'))) {
                 $hex = ConvertTo-HexString $r.PlanHandle
                 $sources.Add([pscustomobject]@{
@@ -1813,13 +1817,13 @@ SELECT query_plan AS PlanText FROM sys.dm_exec_text_query_plan(@PlanHandle, 0, -
         param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][byte[]]$PlanHandle)
         $sql = @"
 SELECT qs.statement_start_offset AS StartOffset, qs.query_hash AS QueryHash, qs.execution_count AS Executions,
-       CAST(qs.total_worker_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgCpuMs,
-       CAST(qs.total_elapsed_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgElapsedMs,
-       CAST(qs.total_logical_reads * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgLogicalReads,
-       CAST(qs.total_rows * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgRows,
-       qs.last_rows AS LastRows, qs.min_rows AS MinRows, qs.max_rows AS MaxRows,
-       SUBSTRING(st.text, qs.statement_start_offset / 2 + 1,
-                 (CASE WHEN qs.statement_end_offset = -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1) AS StatementText
+   CAST(qs.total_worker_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgCpuMs,
+   CAST(qs.total_elapsed_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgElapsedMs,
+   CAST(qs.total_logical_reads * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgLogicalReads,
+   CAST(qs.total_rows * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgRows,
+   qs.last_rows AS LastRows, qs.min_rows AS MinRows, qs.max_rows AS MaxRows,
+   SUBSTRING(st.text, qs.statement_start_offset / 2 + 1,
+             (CASE WHEN qs.statement_end_offset = -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1) AS StatementText
 FROM sys.dm_exec_query_stats AS qs
 CROSS APPLY sys.dm_exec_sql_text(qs.plan_handle) AS st
 WHERE qs.plan_handle = @PlanHandle
@@ -1837,26 +1841,26 @@ OPTION (MAXDOP 1);
         param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][int]$ObjectId)
         $sql = @"
 WITH lp AS (
-    SELECT q.query_id, q.query_hash, p.plan_id, p.is_forced_plan, p.last_execution_time,
-           ROW_NUMBER() OVER (PARTITION BY q.query_id ORDER BY p.last_execution_time DESC) AS rn
-    FROM sys.query_store_query AS q JOIN sys.query_store_plan AS p ON p.query_id = q.query_id
-    WHERE q.object_id = @ObjectId)
+SELECT q.query_id, q.query_hash, p.plan_id, p.is_forced_plan, p.last_execution_time,
+       ROW_NUMBER() OVER (PARTITION BY q.query_id ORDER BY p.last_execution_time DESC) AS rn
+FROM sys.query_store_query AS q JOIN sys.query_store_plan AS p ON p.query_id = q.query_id
+WHERE q.object_id = @ObjectId)
 SELECT TOP (50) lp.query_id AS QueryId, lp.plan_id AS PlanId, lp.query_hash AS QueryHash, lp.is_forced_plan AS IsForced,
-       lp.last_execution_time AS LastExecution,
-       (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = lp.query_id) AS PlanCount,
-       rs.Executions, rs.AvgCpuMs, rs.AvgElapsedMs, rs.AvgLogicalReads, rs.AvgRows, rs.MinRows, rs.MaxRows, rs.LastRows,
-       p.query_plan AS PlanText, qt.query_sql_text AS StatementText
+   lp.last_execution_time AS LastExecution,
+   (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = lp.query_id) AS PlanCount,
+   rs.Executions, rs.AvgCpuMs, rs.AvgElapsedMs, rs.AvgLogicalReads, rs.AvgRows, rs.MinRows, rs.MaxRows, rs.LastRows,
+   p.query_plan AS PlanText, qt.query_sql_text AS StatementText
 FROM lp
 JOIN sys.query_store_plan AS p ON p.plan_id = lp.plan_id
 JOIN sys.query_store_query AS q ON q.query_id = lp.query_id
 JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
 OUTER APPLY (SELECT SUM(r.count_executions) AS Executions,
-                    CAST(SUM(r.avg_cpu_time * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgCpuMs,
-                    CAST(SUM(r.avg_duration * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgElapsedMs,
-                    CAST(SUM(r.avg_logical_io_reads * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgLogicalReads,
-                    CAST(SUM(r.avg_rowcount * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgRows,
-                    MIN(r.min_rowcount) AS MinRows, MAX(r.max_rowcount) AS MaxRows, MAX(r.last_rowcount) AS LastRows
-             FROM sys.query_store_runtime_stats AS r WHERE r.plan_id = lp.plan_id) AS rs
+                CAST(SUM(r.avg_cpu_time * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgCpuMs,
+                CAST(SUM(r.avg_duration * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgElapsedMs,
+                CAST(SUM(r.avg_logical_io_reads * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgLogicalReads,
+                CAST(SUM(r.avg_rowcount * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgRows,
+                MIN(r.min_rowcount) AS MinRows, MAX(r.max_rowcount) AS MaxRows, MAX(r.last_rowcount) AS LastRows
+         FROM sys.query_store_runtime_stats AS r WHERE r.plan_id = lp.plan_id) AS rs
 WHERE lp.rn = 1
 ORDER BY lp.query_id
 OPTION (MAXDOP 1);
@@ -1894,6 +1898,7 @@ OPTION (MAXDOP 1);
         $warnings   = New-Object System.Collections.Generic.List[object]
         $missing    = New-Object System.Collections.Generic.List[object]
         $params     = New-Object System.Collections.Generic.List[object]
+        $calls      = New-Object System.Collections.Generic.List[object]
         $nsUri = 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'
         $docIndex = -1
         foreach ($text in $PlanText) {
@@ -1909,20 +1914,33 @@ OPTION (MAXDOP 1);
             $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
             $ns.AddNamespace('p', $nsUri)
 
-            foreach ($st in $xml.SelectNodes('//p:StmtSimple', $ns)) {
+            # Every statement kind: StmtSimple, StmtCond (IF/WHILE: its own query is under Condition), StmtCursor, StmtReceive, ...
+            foreach ($st in $xml.SelectNodes("//*[starts-with(local-name(), 'Stmt') and @StatementId]")) {
                 $sid = "$docIndex." + $st.GetAttribute('StatementId')
-                $qp = $st.SelectSingleNode('./p:QueryPlan', $ns)
+                $qps = @($st.SelectNodes('./p:QueryPlan | ./p:Condition/p:QueryPlan | ./p:CursorPlan//p:QueryPlan', $ns))
+                $text = ([string]$st.GetAttribute('StatementText')).Trim()
+                $type = $st.GetAttribute('StatementType')
+                if (-not $type) { $type = $st.LocalName -replace '^Stmt', '' }
+                $spNode = $st.SelectSingleNode('./p:StoredProc', $ns)
+                $called = if ($spNode) { $spNode.GetAttribute('ProcName') } else { $null }
+                $isDynamic = ($called -match '(?i)sp_executesql\]?$') -or ($type -match '(?i)EXECUTE STRING|DYNAMIC') -or ($text -match '(?i)\bsp_executesql\b|\bEXEC(UTE)?\s*\(\s*@')
                 $stmt = [pscustomobject]@{
                     Key = $sid; DocIndex = $docIndex; StatementId = [int](ConvertTo-InvariantDouble $st.GetAttribute('StatementId'))
-                    Type = $st.GetAttribute('StatementType'); Text = ($st.GetAttribute('StatementText')).Trim()
+                    Type = $type; Text = $text
                     Cost = ConvertTo-InvariantDouble $st.GetAttribute('StatementSubTreeCost')
                     EstRows = ConvertTo-InvariantDouble $st.GetAttribute('StatementEstRows')
                     QueryHash = $st.GetAttribute('QueryHash'); OptmLevel = $st.GetAttribute('StatementOptmLevel')
                     CeVersion = $st.GetAttribute('CardinalityEstimationModelVersion')
-                    HasPlan = $null -ne $qp; Tables = New-Object System.Collections.Generic.List[string]
+                    HasPlan = $qps.Count -gt 0; Tables = New-Object System.Collections.Generic.List[string]
+                    IsDynamic = [bool]$isDynamic; CalledProc = $(if ($called -and -not ($called -match '(?i)sp_executesql\]?$')) { $called } else { $null })
                 }
                 $statements.Add($stmt)
-                if (-not $qp) { continue }
+                if ($stmt.CalledProc) { $calls.Add([pscustomobject]@{ StatementKey = $sid; Name = $stmt.CalledProc; Kind = 'Procedure' }) }
+                foreach ($qp in $qps) {
+                foreach ($fn in $qp.SelectNodes('.//p:UserDefinedFunction', $ns)) { $calls.Add([pscustomobject]@{ StatementKey = $sid; Name = $fn.GetAttribute('FunctionName'); Kind = 'Function' }) }
+                foreach ($tvf in $qp.SelectNodes(".//p:RelOp[@PhysicalOp='Table-valued function']/*/p:Object", $ns)) {
+                    $calls.Add([pscustomobject]@{ StatementKey = $sid; Name = ('[{0}].[{1}].[{2}]' -f (Remove-SqlBrackets $tvf.GetAttribute('Database')), (Remove-SqlBrackets $tvf.GetAttribute('Schema')), (Remove-SqlBrackets $tvf.GetAttribute('Table'))); Kind = 'Table-valued function' })
+                }
 
                 foreach ($si in $qp.SelectNodes('./p:OptimizerStatsUsage/p:StatisticsInfo', $ns)) {
                     $statsUsed.Add([pscustomobject]@{
@@ -1969,6 +1987,7 @@ OPTION (MAXDOP 1);
                 foreach ($op in $qp.SelectNodes('.//p:RelOp', $ns)) {
                     $obj = $op.SelectSingleNode('./*/p:Object', $ns)
                     if (-not $obj) { continue }
+                    if ($op.GetAttribute('PhysicalOp') -eq 'Table-valued function') { continue }
                     $child = $obj.ParentNode
                     $phys = $op.GetAttribute('PhysicalOp')
                     $isLookup = $child.GetAttribute('Lookup') -in '1', 'true' -or $phys -eq 'RID Lookup' -or $phys -eq 'Key Lookup'
@@ -1988,13 +2007,23 @@ OPTION (MAXDOP 1);
                         HasPredicate = $null -ne $child.SelectSingleNode('./p:Predicate', $ns)
                     })
                 }
+                }
             }
         }
         [pscustomobject]@{
             Statements = $statements.ToArray(); Operators = $operators.ToArray(); StatsUsed = $statsUsed.ToArray()
             Warnings = $warnings.ToArray(); MissingIndexes = $missing.ToArray(); Parameters = $params.ToArray()
+            Calls = @($calls | Group-Object Name, Kind | ForEach-Object { $_.Group[0] })
             HasStatsUsage = $statsUsed.Count -gt 0
         }
+    }
+
+    function ConvertTo-NormalizedSqlText {
+        param([string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+        $t = ([regex]::Replace($Text, '\s+', ' ')).Trim().TrimEnd(';').ToLowerInvariant()
+        if ($t.Length -gt 200) { $t = $t.Substring(0, 200) }
+        $t
     }
 
     function Test-IsLocalPlanObject {
@@ -2006,6 +2035,91 @@ OPTION (MAXDOP 1);
         $true
     }
 
+    function Get-ModuleDefinition {
+        param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][int]$ObjectId)
+        $r = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'module definition' -Parameters @{ ObjectId = $ObjectId } -Sql 'SELECT OBJECT_DEFINITION(@ObjectId) AS Definition;'))[0]
+        if ($r) { [string]$r.Definition } else { $null }
+    }
+
+    function Get-DynamicSqlHint {
+        <# Does the module build dynamic SQL? Suggests a text fragment to search the plan cache / Query Store with. #>
+        param([string]$Definition)
+        $res = [ordered]@{ UsesDynamicSql = $false; Encrypted = [string]::IsNullOrEmpty($Definition); Patterns = @(); SuggestedSearch = $null }
+        if ($res.Encrypted) { return [pscustomobject]$res }
+        $code = [regex]::Replace($Definition, '(?s)/\*.*?\*/', ' ')
+        $code = [regex]::Replace($code, '--[^\r\n]*', ' ')
+        $pats = @()
+        if ($code -match '(?i)\bsp_executesql\b') { $pats += 'sp_executesql' }
+        if ($code -match '(?i)\bEXEC(UTE)?\s*\(\s*[@N'']') { $pats += 'EXEC(...)' }
+        $res.Patterns = $pats
+        $res.UsesDynamicSql = $pats.Count -gt 0
+        if ($res.UsesDynamicSql) {
+            # first string literal that looks like SQL: take a distinctive single-line piece of it
+            foreach ($m in [regex]::Matches($code, "N?'((?:[^']|'')*)'")) {
+                $lit = $m.Groups[1].Value.Replace("''", "'")
+                if ($lit -notmatch '(?i)\b(SELECT|UPDATE|INSERT|DELETE|MERGE|FROM)\b') { continue }
+                $lines = @($lit -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -ge 12 })
+                $pick = $lines | Where-Object { $_ -match '(?i)\bFROM\b|\bJOIN\b|\bUPDATE\b|\bINTO\b' } | Select-Object -First 1
+                if (-not $pick) { $pick = $lines | Select-Object -First 1 }
+                if ($pick) { if ($pick.Length -gt 60) { $pick = $pick.Substring(0, 60) }; $res.SuggestedSearch = $pick.Trim(); break }
+            }
+        }
+        [pscustomobject]$res
+    }
+
+    function Get-PlanTableMetadata {
+        <# Index/stats metadata for the permanent tables (in this database) that a parsed plan touches, plus called modules. #>
+        param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)]$Plan, [Parameter(Mandatory)]$ServerInfo, [Parameter(Mandatory)]$DatabaseInfo, [int]$MaxTables = 30)
+        $warnings = New-Object System.Collections.Generic.List[string]
+        $db = [string]$DatabaseInfo.DatabaseName
+        $names = New-Object System.Collections.Generic.List[string]
+        $other = New-Object System.Collections.Generic.List[string]
+        $refs = @($Plan.Operators | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } }) +
+                @($Plan.StatsUsed | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } }) +
+                @($Plan.MissingIndexes | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } })
+        foreach ($r in $refs) {
+            if (Test-IsLocalPlanObject -Database $r.D -Table $r.T -CurrentDatabase $db) {
+                $n = (ConvertTo-QuotedName $(if ($r.S) { $r.S } else { 'dbo' })) + '.' + (ConvertTo-QuotedName $r.T)
+                if (-not $names.Contains($n)) { $names.Add($n) }
+            } elseif ($r.T -and -not $r.T.StartsWith('#') -and -not $r.T.StartsWith('@')) {
+                $o = "$($r.D).$($r.S).$($r.T)"; if (-not $other.Contains($o)) { $other.Add($o) }
+            }
+        }
+        if ($names.Count -gt $MaxTables) { $warnings.Add("The plan touches $($names.Count) tables; only the first $MaxTables are analyzed."); $keep = @($names | Select-Object -First $MaxTables); $names.Clear(); foreach ($n in $keep) { $names.Add($n) } }
+        # called procedures / functions in this database: resolve their object_id so they can be analyzed next
+        $calledNames = New-Object System.Collections.Generic.List[object]
+        foreach ($c in $Plan.Calls) {
+            $parts = @(([string]$c.Name) -split '\]\.\[' | ForEach-Object { $_.Trim('[', ']') })
+            $cdb = if ($parts.Count -ge 3) { $parts[-3] } else { $db }
+            $sch = if ($parts.Count -ge 2) { $parts[-2] } else { 'dbo' }
+            $nm = $parts[-1]
+            if ($cdb -ne $db) { $calledNames.Add([pscustomobject]@{ Name = $c.Name; Kind = $c.Kind; StatementKey = $c.StatementKey; ObjectId = $null; Display = "$cdb.$sch.$nm"; OtherDatabase = $true }); continue }
+            $calledNames.Add([pscustomobject]@{ Name = $c.Name; Kind = $c.Kind; StatementKey = $c.StatementKey; ObjectId = $null; Display = "$sch.$nm"; OtherDatabase = $false; Quoted = ((ConvertTo-QuotedName $sch) + '.' + (ConvertTo-QuotedName $nm)) })
+        }
+        $tables = New-Object System.Collections.Generic.List[object]
+        $lookup = @($names) + @($calledNames | Where-Object { -not $_.OtherDatabase } | ForEach-Object { $_.Quoted })
+        if ($lookup.Count -gt 0) {
+            $p = @{}; $vals = @()
+            for ($i = 0; $i -lt $lookup.Count; $i++) { $p["n$i"] = $lookup[$i]; $vals += "(@n$i)" }
+            $ids = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'resolve plan tables' -Parameters $p -Sql ("SELECT v.Name, OBJECT_ID(v.Name) AS ObjectId, OBJECT_SCHEMA_NAME(OBJECT_ID(v.Name)) AS SchemaName, OBJECT_NAME(OBJECT_ID(v.Name)) AS TableName, CAST(OBJECTPROPERTYEX(OBJECT_ID(v.Name), 'BaseType') AS nvarchar(10)) AS BaseType FROM (VALUES " + ($vals -join ', ') + ") AS v(Name);")))
+            $byName = @{}; foreach ($t in $ids) { $byName[[string]$t.Name] = $t }
+            foreach ($c in $calledNames) { if ($c.PSObject.Properties['Quoted'] -and $byName.ContainsKey($c.Quoted) -and $byName[$c.Quoted].ObjectId) { $c.ObjectId = [int]$byName[$c.Quoted].ObjectId } }
+            foreach ($n in $names) {
+                $t = $byName[$n]
+                if (-not $t -or -not $t.ObjectId) { continue }
+                if ($t.BaseType -and ([string]$t.BaseType).Trim() -ne 'U') { continue }     # views, functions: no rowstore maintenance here
+                $entry = [ordered]@{ ObjectId = [int]$t.ObjectId; SchemaName = $t.SchemaName; TableName = $t.TableName; Indexes = @(); Statistics = @(); RowCount = $null; ReservedMB = $null }
+                try { $entry.Indexes = @(Get-TableIndexes -Context $Context -ObjectId $t.ObjectId) } catch { $warnings.Add("Indexes of $($t.Name): $($_.Exception.Message)") }
+                try { $entry.Statistics = @(Get-TableStatistics -Context $Context -ObjectId $t.ObjectId -ServerInfo $ServerInfo) } catch { $warnings.Add("Statistics of $($t.Name): $($_.Exception.Message)") }
+                $base = @($entry.Indexes | Where-Object { $_.IndexId -in 0, 1 })
+                if ($base.Count) { $entry.RowCount = ($base | Measure-Object RowCount -Sum).Sum }
+                $entry.ReservedMB = ($entry.Indexes | Measure-Object SizeMB -Sum).Sum
+                $tables.Add([pscustomobject]$entry)
+            }
+        }
+        [pscustomobject]@{ Tables = $tables.ToArray(); OtherObjects = $other.ToArray(); Called = $calledNames.ToArray(); Warnings = $warnings.ToArray() }
+    }
+
     function Invoke-ProcedureAnalysis {
         <# Runs on the worker: finds plan sources, reads the chosen plan, parses it, and loads index/stats metadata for the tables it touches. #>
         param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][int]$ObjectId, [Parameter(Mandatory)]$ServerInfo, [Parameter(Mandatory)]$DatabaseInfo,
@@ -2014,9 +2128,12 @@ OPTION (MAXDOP 1);
         $src = Get-ProcedurePlanSources -Context $Context -ObjectId $ObjectId -ServerInfo $ServerInfo
         foreach ($w in $src.Warnings) { $warnings.Add($w) }
         $sources = @($src.Sources)
-        $result = [ordered]@{ ObjectId = $ObjectId; Sources = $sources; Source = $null; PlanTexts = @(); Plan = $null; StatementStats = @(); Tables = @(); OtherObjects = @(); Warnings = $null }
+        $result = [ordered]@{ Kind = 'Module'; ObjectId = $ObjectId; Sources = $sources; Source = $null; PlanTexts = @(); Plan = $null; StatementStats = @(); Tables = @(); OtherObjects = @(); Called = @(); Dynamic = $null; Warnings = $null }
+        # the definition tells us about dynamic SQL even when the branch that runs it was never compiled
+        try { $result.Dynamic = Get-DynamicSqlHint -Definition (Get-ModuleDefinition -Context $Context -ObjectId $ObjectId) } catch { }
         if ($sources.Count -eq 0) {
             $warnings.Add('No plan found: the procedure is not in the plan cache (not run since the last restart or cache flush, or it uses WITH RECOMPILE) and Query Store has nothing for it. Run it normally once, then analyze again. This tool will not execute it.')
+            if ($result.Dynamic -and $result.Dynamic.UsesDynamicSql) { $warnings.Add('It builds dynamic SQL: those statements are cached on their own. Use Find query (SQL text contains) to analyze them.') }
             $result.Warnings = $warnings.ToArray(); return [pscustomobject]$result
         }
         $chosen = $null
@@ -2040,40 +2157,9 @@ OPTION (MAXDOP 1);
         $plan = ConvertFrom-ShowPlanXml -PlanText $result.PlanTexts
         $result.Plan = $plan
 
-        # tables this plan touches, in this database
-        $db = [string]$DatabaseInfo.DatabaseName
-        $names = New-Object System.Collections.Generic.List[string]
-        $other = New-Object System.Collections.Generic.List[string]
-        $refs = @($plan.Operators | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } }) +
-                @($plan.StatsUsed | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } }) +
-                @($plan.MissingIndexes | ForEach-Object { [pscustomobject]@{ D = $_.Database; S = $_.Schema; T = $_.Table } })
-        foreach ($r in $refs) {
-            if (Test-IsLocalPlanObject -Database $r.D -Table $r.T -CurrentDatabase $db) {
-                $n = (ConvertTo-QuotedName $(if ($r.S) { $r.S } else { 'dbo' })) + '.' + (ConvertTo-QuotedName $r.T)
-                if (-not $names.Contains($n)) { $names.Add($n) }
-            } elseif ($r.T -and -not $r.T.StartsWith('#') -and -not $r.T.StartsWith('@')) {
-                $o = "$($r.D).$($r.S).$($r.T)"; if (-not $other.Contains($o)) { $other.Add($o) }
-            }
-        }
-        $result.OtherObjects = $other.ToArray()
-        if ($names.Count -gt $MaxTables) { $warnings.Add("The plan touches $($names.Count) tables; only the first $MaxTables are analyzed."); $keep = @($names | Select-Object -First $MaxTables); $names.Clear(); foreach ($n in $keep) { $names.Add($n) } }
-        $tables = New-Object System.Collections.Generic.List[object]
-        if ($names.Count -gt 0) {
-            $p = @{}; $vals = @()
-            for ($i = 0; $i -lt $names.Count; $i++) { $p["n$i"] = $names[$i]; $vals += "(@n$i)" }
-            $ids = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'resolve plan tables' -Parameters $p -Sql ("SELECT v.Name, OBJECT_ID(v.Name) AS ObjectId, OBJECT_SCHEMA_NAME(OBJECT_ID(v.Name)) AS SchemaName, OBJECT_NAME(OBJECT_ID(v.Name)) AS TableName FROM (VALUES " + ($vals -join ', ') + ") AS v(Name);")))
-            foreach ($t in $ids) {
-                if (-not $t.ObjectId) { continue }
-                $entry = [ordered]@{ ObjectId = [int]$t.ObjectId; SchemaName = $t.SchemaName; TableName = $t.TableName; Indexes = @(); Statistics = @(); RowCount = $null; ReservedMB = $null }
-                try { $entry.Indexes = @(Get-TableIndexes -Context $Context -ObjectId $t.ObjectId) } catch { $warnings.Add("Indexes of $($t.Name): $($_.Exception.Message)") }
-                try { $entry.Statistics = @(Get-TableStatistics -Context $Context -ObjectId $t.ObjectId -ServerInfo $ServerInfo) } catch { $warnings.Add("Statistics of $($t.Name): $($_.Exception.Message)") }
-                $base = @($entry.Indexes | Where-Object { $_.IndexId -in 0, 1 })
-                if ($base.Count) { $entry.RowCount = ($base | Measure-Object RowCount -Sum).Sum }
-                $entry.ReservedMB = ($entry.Indexes | Measure-Object SizeMB -Sum).Sum
-                $tables.Add([pscustomobject]$entry)
-            }
-        }
-        $result.Tables = $tables.ToArray()
+        $meta = Get-PlanTableMetadata -Context $Context -Plan $plan -ServerInfo $ServerInfo -DatabaseInfo $DatabaseInfo -MaxTables $MaxTables
+        foreach ($w in $meta.Warnings) { $warnings.Add($w) }
+        $result.Tables = $meta.Tables; $result.OtherObjects = $meta.OtherObjects; $result.Called = $meta.Called
         $result.Warnings = $warnings.ToArray()
         [pscustomobject]$result
     }
@@ -2099,12 +2185,21 @@ OPTION (MAXDOP 1);
         function Get-Pri($score) { if ($score -ge 60) { 'High' } elseif ($score -ge 30) { 'Medium' } elseif ($score -gt 0) { 'Low' } else { 'None' } }
 
         # statement runtime vs estimate (match plan statements to runtime stats by query hash)
-        $runtime = @{}
-        foreach ($s in $Analysis.StatementStats) { if ($s.QueryHash -and -not $runtime.ContainsKey([string]$s.QueryHash)) { $runtime[[string]$s.QueryHash] = $s } }
+        # match runtime rows to plan statements: by query hash, else by normalized statement text
+        $runtime = @{}; $byText = @{}
+        $zeroHash = '0x0000000000000000'
+        foreach ($s in $Analysis.StatementStats) {
+            if ($s.QueryHash -and [string]$s.QueryHash -ne $zeroHash -and -not $runtime.ContainsKey([string]$s.QueryHash)) { $runtime[[string]$s.QueryHash] = $s }
+            $nt = ConvertTo-NormalizedSqlText ([string]$s.StatementText)
+            if ($nt -and -not $byText.ContainsKey($nt)) { $byText[$nt] = $s }
+        }
         $suspectTables = @{}
+        $noRuntime = New-Object System.Collections.Generic.List[object]
         foreach ($st in $plan.Statements) {
-            if (-not $st.QueryHash -or -not $runtime.ContainsKey($st.QueryHash)) { continue }
-            $rt = $runtime[$st.QueryHash]
+            $rt = $null
+            if ($st.QueryHash -and $st.QueryHash -ne $zeroHash -and $runtime.ContainsKey($st.QueryHash)) { $rt = $runtime[$st.QueryHash] }
+            if (-not $rt) { $nt = ConvertTo-NormalizedSqlText $st.Text; if ($nt -and $byText.ContainsKey($nt)) { $rt = $byText[$nt] } }
+            if (-not $rt) { if ($st.HasPlan -and @($Analysis.StatementStats).Count -gt 0) { $noRuntime.Add($st) }; continue }
             $st | Add-Member -NotePropertyName Runtime -NotePropertyValue $rt -Force
             $act = if ($null -ne $rt.AvgRows) { [double]$rt.AvgRows } else { $null }
             $est = [double]$st.EstRows
@@ -2240,6 +2335,35 @@ OPTION (MAXDOP 1);
             Add-F 'Review' $sc 'Index' "$($m.Schema).$($m.Table)" 'Missing index' ("The optimizer estimates an index would cut this statement's cost by {0:N0}%: keys ({1}){2}." -f [double]$m.Impact, (@($m.EqualityColumns, $m.InequalityColumns | Where-Object { $_ }) -join ', '), $(if ($m.IncludedColumns) { " INCLUDE ($($m.IncludedColumns))" } else { '' })) 'Review before creating (check existing indexes for overlap)' @{ StatementKey = $m.StatementKey; _Missing = $mi; MissingSchema = $m.Schema; MissingTable = $m.Table }
         }
 
+        if ($noRuntime.Count -gt 0) {
+            Add-F 'None' 0 'Plan' '' "$($noRuntime.Count) statement(s)" ("Statement(s) {0} are in the plan but have not run since it was cached, so they have no runtime numbers (typically IF/ELSE branches not taken, early RETURNs, or error paths). Their estimates are still analyzed." -f ((@($noRuntime | ForEach-Object { $_.StatementId }) | Select-Object -First 15) -join ', ')) 'No action' $null
+        }
+
+        # dynamic SQL: its statements are compiled and cached on their own, not under this module
+        $dynStmts = @($plan.Statements | Where-Object { $_.IsDynamic })
+        $hint = $null; if ($Analysis.PSObject.Properties['Dynamic']) { $hint = $Analysis.Dynamic }
+        if ($dynStmts.Count -gt 0 -or ($hint -and $hint.UsesDynamicSql)) {
+            $sugg = if ($hint -and $hint.SuggestedSearch) { $hint.SuggestedSearch } else { $null }
+            Add-F 'Review' 40 'Plan' '' 'Dynamic SQL' ("This module runs dynamic SQL ({0}). Those statements get their own cached plans (and their own Query Store entries with no object_id), so their statistics and index needs are NOT in this analysis.{1}" -f $(if ($hint -and $hint.Patterns) { $hint.Patterns -join ', ' } else { 'sp_executesql / EXEC' }), $(if ($sugg) { " Suggested search text: '$sugg'." } else { '' })) 'Double-click: search for it with Find query (SQL text contains)' @{ SuggestedSearch = $sugg; StatementKey = $(if ($dynStmts.Count) { $dynStmts[0].Key } else { $null }) }
+        }
+        # nested modules: their statements run under their own plans
+        $called = @(); if ($Analysis.PSObject.Properties['Called']) { $called = @($Analysis.Called) }
+        foreach ($c in $called) {
+            switch ($c.Kind) {
+                'Procedure' { Add-F 'Review' 20 'Plan' '' "Calls $($c.Display)" "Calls procedure $($c.Display). Its statements have their own plan and are not part of this analysis." $(if ($c.ObjectId) { 'Double-click to analyze it' } elseif ($c.OtherDatabase) { 'In another database: connect to it to analyze' } else { 'Analyze it separately' }) @{ CalledObjectId = $c.ObjectId; CalledName = $c.Display; StatementKey = $c.StatementKey } }
+                'Function' { Add-F 'Review' 30 'Plan' '' "Function $($c.Display)" "Uses scalar function $($c.Display). Scalar UDFs run once per row, prevent a parallel plan, and hide their cost from the plan (SQL 2019+ can inline simple ones). Its own statements have a separate plan." $(if ($c.ObjectId) { 'Double-click to analyze it' } else { 'Analyze it separately' }) @{ CalledObjectId = $c.ObjectId; CalledName = $c.Display; StatementKey = $c.StatementKey } }
+                default { Add-F 'Review' 30 'Plan' '' "TVF $($c.Display)" "Reads table-valued function $($c.Display). A multi-statement TVF has a fixed row estimate (1 or 100 rows; interleaved execution helps on SQL 2017+), which often leads to poor joins. Its statements have a separate plan." $(if ($c.ObjectId) { 'Double-click to analyze it' } else { 'Analyze it separately' }) @{ CalledObjectId = $c.ObjectId; CalledName = $c.Display; StatementKey = $c.StatementKey } }
+            }
+        }
+
+        if ($Analysis.PSObject.Properties['Kind'] -and $Analysis.Kind -eq 'Query' -and @($Analysis.Sources | Where-Object { $_.Source -eq 'Query Store' }).Count -gt 1) {
+            $qsPlans = @($Analysis.Sources | Where-Object { $_.Source -eq 'Query Store' })
+            $ms = @($qsPlans | ForEach-Object { [double]$_.Item.AvgElapsedMs } | Where-Object { $_ -gt 0 })
+            $spread = if ($ms.Count -gt 1) { ($ms | Measure-Object -Maximum).Maximum / [math]::Max(0.001, ($ms | Measure-Object -Minimum).Minimum) } else { 1 }
+            $sc = if ($spread -ge 5) { 55 } else { 30 }
+            Add-F $(if ($spread -ge 5) { 'Medium' } else { 'Review' }) $sc 'Plan' '' "$($qsPlans.Count) plans" ("Query Store has {0} different plans for this query; average duration ranges {1}. Plan changes often follow statistics updates or parameter sniffing. Compare them with the Plan picker; Query Store can force the good one." -f $qsPlans.Count, $(if ($ms.Count -gt 1) { '{0:N1} ms to {1:N1} ms ({2:N0}x)' -f ($ms | Measure-Object -Minimum).Minimum, ($ms | Measure-Object -Maximum).Maximum, $spread } else { 'similarly' })) 'Compare plans (picker above); consider forcing the best plan in Query Store' $null
+        }
+
         $order = @{ 'High' = 0; 'Medium' = 1; 'Review' = 2; 'Low' = 3; 'None' = 4 }
         # emit one finding at a time; callers collect with @()
         $findings | Sort-Object @{ Expression = { $order[$_.Priority] } }, @{ Expression = 'Score'; Descending = $true }
@@ -2248,12 +2372,13 @@ OPTION (MAXDOP 1);
     function Get-ProcedureSummaryText {
         param([Parameter(Mandatory)]$Analysis, [string]$ProcName, $Findings)
         $sb = New-Object System.Text.StringBuilder
-        [void]$sb.AppendLine("PROCEDURE  $ProcName")
+        [void]$sb.AppendLine($(if ($Analysis.PSObject.Properties['Kind'] -and $Analysis.Kind -eq 'Query') { "QUERY  $ProcName" } else { "MODULE  $ProcName" }))
         if ($Analysis.Source) { [void]$sb.AppendLine("  Plan source: $($Analysis.Source.Label)") }
-        [void]$sb.AppendLine('  Read from the plan the procedure already has. The procedure was NOT executed or compiled. Plan-cache numbers are estimates; runtime row counts come from sys.dm_exec_query_stats / Query Store.')
+        [void]$sb.AppendLine('  Read from the plan that already exists. Nothing was executed or compiled. Plan-cache numbers are estimates; runtime row counts come from sys.dm_exec_query_stats / Query Store.')
         if ($Analysis.Plan) {
             $p = $Analysis.Plan
-            [void]$sb.AppendLine(("  {0} statement(s), {1} data-access operator(s), {2} statistic(s) recorded as used{3}." -f @($p.Statements).Count, @($p.Operators).Count, @($p.StatsUsed).Count, $(if (-not $p.HasStatsUsage) { ' (this SQL version does not record them: SQL 2017 / 2016 SP2+ does)' } else { '' })))
+            $ran = @($p.Statements | Where-Object { $_.PSObject.Properties['Runtime'] }).Count
+            [void]$sb.AppendLine(("  {0} statement(s) ({1} with runtime numbers; the rest have not run since the plan was cached, e.g. IF branches not taken), {2} data-access operator(s), {3} statistic(s) recorded as used{4}." -f @($p.Statements).Count, $ran, @($p.Operators).Count, @($p.StatsUsed).Count, $(if (-not $p.HasStatsUsage) { ' (this SQL version does not record them: SQL 2017 / 2016 SP2+ does)' } else { '' })))
             [void]$sb.AppendLine("  Tables analyzed: " + $(if (@($Analysis.Tables).Count) { (@($Analysis.Tables) | ForEach-Object { "$($_.SchemaName).$($_.TableName)" }) -join ', ' } else { 'none' }))
             if (@($Analysis.OtherObjects).Count) { [void]$sb.AppendLine("  Other databases (not analyzed): " + (@($Analysis.OtherObjects) -join ', ')) }
             $pv = @($p.Parameters | Group-Object Name | ForEach-Object { $_.Group[0] })
@@ -2266,6 +2391,228 @@ OPTION (MAXDOP 1);
         }
         foreach ($w in $Analysis.Warnings) { [void]$sb.AppendLine("  NOTE: $w") }
         $sb.ToString()
+    }
+
+    function ConvertFrom-HexString {
+        param([string]$Hex)
+        $h = $Hex.Trim()
+        if ($h -match '^0[xX]') { $h = $h.Substring(2) }
+        if ($h.Length -eq 0 -or $h.Length % 2 -ne 0 -or $h -notmatch '^[0-9A-Fa-f]+$') { throw "Not a valid hex value: '$Hex'" }
+        $bytes = New-Object byte[] ($h.Length / 2)
+        for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($h.Substring($i * 2, 2), 16) }
+        ,$bytes
+    }
+
+    function ConvertTo-LikePattern {
+        <# Literal text -> '%text%' with LIKE wildcards escaped (the value is passed as a parameter, never concatenated). #>
+        param([string]$Text)
+        '%' + $Text.Replace('[', '[[]').Replace('%', '[%]').Replace('_', '[_]') + '%'
+    }
+
+    function Find-QueryPlans {
+        <#
+            Finds statements by query hash, query plan hash, Query Store query_id, plan handle, or SQL text.
+            Plan cache: server-wide (any database, ad hoc, prepared, dynamic SQL). Query Store: the current database.
+            Guardrails: TOP (50), MAXDOP 1, parameterized values, text search needs 6+ characters and is refused when the server is busy.
+        #>
+        param(
+            [Parameter(Mandatory)]$Context, [Parameter(Mandatory)][ValidateSet('QueryHash', 'QueryPlanHash', 'QueryId', 'PlanHandle', 'Text')][string]$Mode,
+            [Parameter(Mandatory)][string]$Value, [Parameter(Mandatory)]$ServerInfo, [Parameter(Mandatory)]$Settings, [string]$Environment,
+            [bool]$PlanCache = $true, [bool]$QueryStore = $true
+        )
+        $items = New-Object System.Collections.Generic.List[object]
+        $warnings = New-Object System.Collections.Generic.List[string]
+        $v = $Value.Trim()
+        $param = @{}
+        switch ($Mode) {
+            'QueryHash'     { $b = ConvertFrom-HexString $v; if ($b.Length -ne 8) { throw 'A query hash is 8 bytes, e.g. 0x1A2B3C4D5E6F7081.' }; $param.H = $b }
+            'QueryPlanHash' { $b = ConvertFrom-HexString $v; if ($b.Length -ne 8) { throw 'A query plan hash is 8 bytes, e.g. 0x1A2B3C4D5E6F7081.' }; $param.H = $b }
+            'PlanHandle'    { $b = ConvertFrom-HexString $v; if ($b.Length -gt 64) { throw 'A plan handle is at most 64 bytes.' }; $param.H = $b }
+            'QueryId'       { $id = 0L; if (-not [long]::TryParse($v, [ref]$id) -or $id -le 0) { throw 'A Query Store query_id is a positive number.' }; $param.Id = $id; $PlanCache = $false }
+            'Text'          { if ($v.Length -lt 6) { throw 'Type at least 6 characters of the statement text.' }; $param.Pat = ConvertTo-LikePattern $v }
+        }
+        if ($Mode -eq 'PlanHandle') { $QueryStore = $false }
+
+        if ($PlanCache) {
+            if ($Mode -eq 'Text') {
+                # a text search reads every cached statement's text: only when the server is not busy
+                try {
+                    $load = Get-ServerLoad -Context $Context
+                    if ([double]$load.AvgRunnableTasks -gt [double]$Settings.MaxAvgRunnableTasks -or [int]$load.BlockedRequests -gt 0) { throw ('Server is busy (avg runnable tasks {0}, blocked requests {1}). Plan cache text search skipped; try again later or search by hash.' -f $load.AvgRunnableTasks, $load.BlockedRequests) }
+                } catch {
+                    if ($_.Exception.Message -like 'Server is busy*') { $warnings.Add($_.Exception.Message); $PlanCache = $false }
+                    elseif (Test-IsProductionEnvironment $Environment) { $warnings.Add('Plan cache text search skipped: server load cannot be checked (needs VIEW SERVER STATE) and this is production.'); $PlanCache = $false }
+                }
+            }
+        }
+        if ($PlanCache) {
+            $stmtText = 'SUBSTRING(st.text, qs.statement_start_offset / 2 + 1, (CASE WHEN qs.statement_end_offset = -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1)'
+            $where = switch ($Mode) {
+                'QueryHash'     { 'qs.query_hash = @H' }
+                'QueryPlanHash' { 'qs.query_plan_hash = @H' }
+                'PlanHandle'    { 'qs.plan_handle = @H' }
+                'Text'          { "st.text LIKE @Pat AND $stmtText LIKE @Pat" }
+            }
+            $sql = @"
+SELECT x.*, DB_NAME(ISNULL(x.DbId, pa.dbid)) AS DatabaseName,
+       CASE WHEN x.ObjId IS NOT NULL THEN OBJECT_SCHEMA_NAME(x.ObjId, ISNULL(x.DbId, pa.dbid)) + N'.' + OBJECT_NAME(x.ObjId, ISNULL(x.DbId, pa.dbid)) END AS ObjectName
+FROM (
+    SELECT TOP (50) qs.plan_handle AS PlanHandle, qs.statement_start_offset AS StartOffset, qs.statement_end_offset AS EndOffset,
+           qs.query_hash AS QueryHash, qs.query_plan_hash AS QueryPlanHash, qs.creation_time AS CachedTime, qs.last_execution_time AS LastExecution,
+           qs.execution_count AS Executions,
+           CAST(qs.total_worker_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgCpuMs,
+           CAST(qs.total_elapsed_time / 1000.0 / NULLIF(qs.execution_count, 0) AS decimal(19,2)) AS AvgElapsedMs,
+           CAST(qs.total_logical_reads * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgLogicalReads,
+           CAST(qs.total_rows * 1.0 / NULLIF(qs.execution_count, 0) AS decimal(19,1)) AS AvgRows,
+           qs.last_rows AS LastRows, qs.min_rows AS MinRows, qs.max_rows AS MaxRows,
+           st.dbid AS DbId, st.objectid AS ObjId,
+           $stmtText AS StatementText
+    FROM sys.dm_exec_query_stats AS qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+    WHERE $where
+    ORDER BY qs.last_execution_time DESC) AS x
+OUTER APPLY (SELECT CONVERT(int, a.value) AS dbid FROM sys.dm_exec_plan_attributes(x.PlanHandle) AS a WHERE a.attribute = N'dbid') AS pa
+ORDER BY x.LastExecution DESC
+OPTION (MAXDOP 1);
+"@
+            try {
+                foreach ($r in @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Sql $sql -Parameters $param -Label "find query in plan cache ($Mode)" -TimeoutSec ([math]::Max(60, $Context.CommandTimeoutSec))))) {
+                    $items.Add([pscustomobject]@{
+                        Source = 'Plan cache'; Key = ('cache:{0}:{1}:{2}' -f (ConvertTo-HexString $r.PlanHandle), $r.StartOffset, $r.EndOffset)
+                        QueryHash = ConvertTo-HexString $r.QueryHash; QueryPlanHash = ConvertTo-HexString $r.QueryPlanHash; QueryId = $null; PlanId = $null
+                        PlanHandle = $r.PlanHandle; StartOffset = $r.StartOffset; EndOffset = $r.EndOffset
+                        DatabaseName = $r.DatabaseName; ObjectName = $r.ObjectName; Executions = $r.Executions; AvgCpuMs = $r.AvgCpuMs; AvgElapsedMs = $r.AvgElapsedMs
+                        AvgLogicalReads = $r.AvgLogicalReads; AvgRows = $r.AvgRows; MinRows = $r.MinRows; MaxRows = $r.MaxRows; LastRows = $r.LastRows
+                        LastExecution = $r.LastExecution; CachedTime = $r.CachedTime; PlanCount = 1; StatementText = $r.StatementText
+                    })
+                }
+            } catch { $warnings.Add("Plan cache search failed: $($_.Exception.Message)") }
+        }
+
+        if ($QueryStore -and $ServerInfo.Capabilities.Major -ge 13) {
+            try {
+                $qsState = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'query store state' -Sql 'SELECT actual_state_desc AS State FROM sys.database_query_store_options;'))[0]
+                if (-not $qsState -or $qsState.State -notin 'READ_WRITE', 'READ_ONLY') { $warnings.Add("Query Store is $(if ($qsState) { $qsState.State } else { 'not available' }) in $($Context.Database).") }
+                else {
+                    $where = switch ($Mode) {
+                        'QueryHash'     { 'q.query_hash = @H' }
+                        'QueryPlanHash' { 'EXISTS (SELECT 1 FROM sys.query_store_plan AS p0 WHERE p0.query_id = q.query_id AND p0.query_plan_hash = @H)' }
+                        'QueryId'       { 'q.query_id = @Id' }
+                        'Text'          { 'qt.query_sql_text LIKE @Pat' }
+                    }
+                    $sql = @"
+WITH f AS (
+    SELECT TOP (50) q.query_id, q.query_hash, q.object_id, q.last_execution_time, qt.query_sql_text
+    FROM sys.query_store_query AS q JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+    WHERE $where
+    ORDER BY q.last_execution_time DESC)
+SELECT f.query_id AS QueryId, f.query_hash AS QueryHash, f.last_execution_time AS LastExecution, f.query_sql_text AS StatementText,
+       CASE WHEN f.object_id > 0 THEN OBJECT_SCHEMA_NAME(f.object_id) + N'.' + OBJECT_NAME(f.object_id) END AS ObjectName,
+       (SELECT COUNT(*) FROM sys.query_store_plan AS p WHERE p.query_id = f.query_id) AS PlanCount,
+       rs.Executions, rs.AvgCpuMs, rs.AvgElapsedMs, rs.AvgLogicalReads, rs.AvgRows, rs.MinRows, rs.MaxRows, rs.LastRows
+FROM f
+OUTER APPLY (SELECT SUM(r.count_executions) AS Executions,
+                    CAST(SUM(r.avg_cpu_time * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgCpuMs,
+                    CAST(SUM(r.avg_duration * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgElapsedMs,
+                    CAST(SUM(r.avg_logical_io_reads * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgLogicalReads,
+                    CAST(SUM(r.avg_rowcount * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgRows,
+                    MIN(r.min_rowcount) AS MinRows, MAX(r.max_rowcount) AS MaxRows, MAX(r.last_rowcount) AS LastRows
+             FROM sys.query_store_runtime_stats AS r JOIN sys.query_store_plan AS p ON p.plan_id = r.plan_id
+             WHERE p.query_id = f.query_id) AS rs
+ORDER BY f.last_execution_time DESC
+OPTION (MAXDOP 1);
+"@
+                    foreach ($r in @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Sql $sql -Parameters $param -Label "find query in Query Store ($Mode)" -TimeoutSec ([math]::Max(60, $Context.CommandTimeoutSec))))) {
+                        $items.Add([pscustomobject]@{
+                            Source = 'Query Store'; Key = "qsq:$($r.QueryId)"; QueryHash = ConvertTo-HexString $r.QueryHash; QueryPlanHash = $null; QueryId = $r.QueryId; PlanId = $null
+                            PlanHandle = $null; StartOffset = $null; EndOffset = $null
+                            DatabaseName = $Context.Database; ObjectName = $r.ObjectName; Executions = $r.Executions; AvgCpuMs = $r.AvgCpuMs; AvgElapsedMs = $r.AvgElapsedMs
+                            AvgLogicalReads = $r.AvgLogicalReads; AvgRows = $r.AvgRows; MinRows = $r.MinRows; MaxRows = $r.MaxRows; LastRows = $r.LastRows
+                            LastExecution = $r.LastExecution; CachedTime = $null; PlanCount = $r.PlanCount; StatementText = $r.StatementText
+                        })
+                    }
+                }
+            } catch { $warnings.Add("Query Store search failed: $($_.Exception.Message)") }
+        }
+        [pscustomobject]@{ Items = $items.ToArray(); Warnings = $warnings.ToArray() }
+    }
+
+    function Get-QueryAnalysisSources {
+        <# Plans to choose from for one found statement: other cached plans of the same query hash, or every Query Store plan of the query_id. #>
+        param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)]$Item, [Parameter(Mandatory)]$ServerInfo, [Parameter(Mandatory)]$Settings)
+        $out = New-Object System.Collections.Generic.List[object]
+        $mk = {
+            param($src, $key, $r, $planHash, $extra)
+            [pscustomobject]@{ Source = $src; Key = $key; Item = $r; LastExecution = $r.LastExecution
+                Label = ('{0}: plan hash {1}, last run {2:yyyy-MM-dd HH:mm}, {3:N0} executions, avg {4:N1} ms, {5:N0} reads, avg {6:N0} rows{7}' -f $src, $planHash, $r.LastExecution, [double]$r.Executions, [double]$r.AvgElapsedMs, [double]$r.AvgLogicalReads, [double]$r.AvgRows, $extra) }
+        }
+        if ($Item.Source -eq 'Plan cache') {
+            $out.Add((& $mk 'Plan cache' $Item.Key $Item $Item.QueryPlanHash ''))
+            if ($Item.QueryHash -and $Item.QueryHash -ne '0x0000000000000000') {
+                try {
+                    $same = Find-QueryPlans -Context $Context -Mode QueryHash -Value $Item.QueryHash -ServerInfo $ServerInfo -Settings $Settings -PlanCache $true -QueryStore $false
+                    foreach ($r in $same.Items) { if ($r.Key -ne $Item.Key) { $out.Add((& $mk 'Plan cache' $r.Key $r $r.QueryPlanHash $(if ($r.DatabaseName) { " ($($r.DatabaseName))" } else { '' }))) } }
+                } catch { }
+            }
+        } else {
+            $sql = @"
+SELECT p.plan_id AS PlanId, p.query_plan_hash AS QueryPlanHash, p.is_forced_plan AS IsForced, p.last_execution_time AS LastExecution,
+       rs.Executions, rs.AvgCpuMs, rs.AvgElapsedMs, rs.AvgLogicalReads, rs.AvgRows, rs.MinRows, rs.MaxRows, rs.LastRows
+FROM sys.query_store_plan AS p
+OUTER APPLY (SELECT SUM(r.count_executions) AS Executions,
+                    CAST(SUM(r.avg_cpu_time * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgCpuMs,
+                    CAST(SUM(r.avg_duration * r.count_executions) / NULLIF(SUM(r.count_executions), 0) / 1000.0 AS decimal(19,2)) AS AvgElapsedMs,
+                    CAST(SUM(r.avg_logical_io_reads * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgLogicalReads,
+                    CAST(SUM(r.avg_rowcount * r.count_executions) / NULLIF(SUM(r.count_executions), 0) AS decimal(19,1)) AS AvgRows,
+                    MIN(r.min_rowcount) AS MinRows, MAX(r.max_rowcount) AS MaxRows, MAX(r.last_rowcount) AS LastRows
+             FROM sys.query_store_runtime_stats AS r WHERE r.plan_id = p.plan_id) AS rs
+WHERE p.query_id = @QueryId
+ORDER BY p.last_execution_time DESC
+OPTION (MAXDOP 1);
+"@
+            foreach ($r in @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Sql $sql -Parameters @{ QueryId = [long]$Item.QueryId } -Label 'query store plans of query'))) {
+                $r | Add-Member -NotePropertyName QueryHash -NotePropertyValue $Item.QueryHash -Force
+                $r | Add-Member -NotePropertyName StatementText -NotePropertyValue $Item.StatementText -Force
+                $out.Add((& $mk 'Query Store' "qs:$($r.PlanId)" $r (ConvertTo-HexString $r.QueryPlanHash) $(if ($r.IsForced) { ' (FORCED)' } else { '' })))
+            }
+        }
+        $out.ToArray()   # emitted one by one; callers collect with @()
+    }
+
+    function Invoke-QueryAnalysis {
+        <# Same result shape as Invoke-ProcedureAnalysis, for one statement found with Find-QueryPlans. #>
+        param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)]$Item, [Parameter(Mandatory)]$ServerInfo, [Parameter(Mandatory)]$DatabaseInfo,
+              [Parameter(Mandatory)]$Settings, [string]$SourceKey, [int]$MaxTables = 30)
+        $warnings = New-Object System.Collections.Generic.List[string]
+        $sources = @(Get-QueryAnalysisSources -Context $Context -Item $Item -ServerInfo $ServerInfo -Settings $Settings)
+        $result = [ordered]@{ Kind = 'Query'; ObjectId = $null; Item = $Item; Sources = $sources; Source = $null; PlanTexts = @(); Plan = $null; StatementStats = @(); Tables = @(); OtherObjects = @(); Called = @(); Dynamic = $null; Warnings = $null }
+        if ($sources.Count -eq 0) { $warnings.Add('No plan is available for this query any more (evicted from the plan cache, or purged from Query Store).'); $result.Warnings = $warnings.ToArray(); return [pscustomobject]$result }
+        $chosen = $null
+        if ($SourceKey) { $chosen = $sources | Where-Object { $_.Key -eq $SourceKey } | Select-Object -First 1 }
+        if (-not $chosen) { $chosen = $sources[0] }
+        $result.Source = $chosen
+        $text = $null
+        if ($chosen.Source -eq 'Plan cache') {
+            $r = $chosen.Item
+            $row = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'statement plan xml' -Parameters @{ PlanHandle = $r.PlanHandle; S = [int]$r.StartOffset; E = [int]$r.EndOffset } -Sql 'SELECT query_plan AS PlanText FROM sys.dm_exec_text_query_plan(@PlanHandle, @S, @E);'))[0]
+            if ($row) { $text = [string]$row.PlanText }
+        } else {
+            $row = @(ConvertTo-ObjectList (Invoke-SafeQuery -Context $Context -Label 'query store plan xml' -Parameters @{ PlanId = [long]$chosen.Item.PlanId } -Sql 'SELECT query_plan AS PlanText FROM sys.query_store_plan WHERE plan_id = @PlanId;'))[0]
+            if ($row) { $text = [string]$row.PlanText }
+        }
+        if (-not $text) { $warnings.Add('The plan was evicted between the search and reading it. Search again.'); $result.Warnings = $warnings.ToArray(); return [pscustomobject]$result }
+        $result.PlanTexts = @($text)
+        $result.StatementStats = @($chosen.Item)
+        $plan = ConvertFrom-ShowPlanXml -PlanText $result.PlanTexts
+        $result.Plan = $plan
+        if ($Item.DatabaseName -and $Item.DatabaseName -ne $DatabaseInfo.DatabaseName) {
+            $warnings.Add("This statement ran in database [$($Item.DatabaseName)]. Index and statistics details are only loaded for tables in [$($DatabaseInfo.DatabaseName)]: pick [$($Item.DatabaseName)] in the Database list and search again to analyze its tables.")
+        }
+        $meta = Get-PlanTableMetadata -Context $Context -Plan $plan -ServerInfo $ServerInfo -DatabaseInfo $DatabaseInfo -MaxTables $MaxTables
+        foreach ($w in $meta.Warnings) { $warnings.Add($w) }
+        $result.Tables = $meta.Tables; $result.OtherObjects = $meta.OtherObjects; $result.Called = $meta.Called
+        $result.Warnings = $warnings.ToArray()
+        [pscustomobject]$result
     }
 
     function New-CreateStatisticsScript {
@@ -2316,6 +2663,7 @@ $script:State = @{
     Busy = $false; Job = $null; PendingObjectId = $null
     ProcMaster = $null; ProcBase = $null; ProcSchemas = @(); ProcNames = @(); ProcRefIds = $null; ProcRefFor = $null
     ProcAnalysis = $null; ProcFindings = @(); ProcStatements = @(); ProcName = $null; ProcObjectId = $null; ProcPlanSuppress = $false
+    FoundItems = @(); QueryItem = $null; AnalysisKind = $null
 }
 $script:Mono = New-Object System.Drawing.Font('Consolas', 9)
 $script:UiFont = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -2377,26 +2725,36 @@ function Get-ColumnType {
     [string]
 }
 
+function ConvertTo-GridValue {
+    # unwrap PSObject; DBNull and empty objects (Windows PowerShell 5.1's "nothing" inside literals) become $null
+    param($Value)
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $null }
+    if ($Value -is [psobject]) { $Value = $Value.psobject.BaseObject }
+    if ($Value -is [System.Management.Automation.PSCustomObject] -and @($Value.psobject.Properties).Count -eq 0) { return $null }
+    if ($Value -is [string] -or $Value -is [ValueType] -or $Value -is [array]) { return ,$Value }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) { return [string]$Value }
+    ,$Value
+}
+
 function New-GridTable {
     param([object[]]$Items, [string[]]$Columns)
     $dt = New-Object System.Data.DataTable
     $types = @{}
     foreach ($c in $Columns) {
         $t = [string]
-        foreach ($it in $Items) { $v = $it.$c; if ($null -ne $v -and -not ($v -is [DBNull])) { $t = Get-ColumnType $v; break } }
+        foreach ($it in $Items) { $v = ConvertTo-GridValue $it.$c; if ($null -ne $v) { $t = Get-ColumnType $v; break } }
         $types[$c] = $t
         [void]$dt.Columns.Add($c, $t)
     }
     foreach ($it in $Items) {
         $row = $dt.NewRow()
         foreach ($c in $Columns) {
-            $v = $it.$c
-            if ($v -is [psobject]) { $v = $v.psobject.BaseObject }
-            if ($null -eq $v -or $v -is [DBNull]) { $row[$c] = [DBNull]::Value; continue }
+            $v = ConvertTo-GridValue $it.$c
+            if ($null -eq $v) { $row[$c] = [DBNull]::Value; continue }
             switch ($types[$c].Name) {
-                'Double'   { $row[$c] = [double]$v }
-                'DateTime' { $row[$c] = [datetime]$v }
-                'Boolean'  { $row[$c] = [bool]$v }
+                'Double'   { try { $row[$c] = [double]$v } catch { $row[$c] = [DBNull]::Value } }
+                'DateTime' { try { $row[$c] = [datetime]$v } catch { $row[$c] = [DBNull]::Value } }
+                'Boolean'  { try { $row[$c] = [bool]$v } catch { $row[$c] = [DBNull]::Value } }
                 default    { if ($v -is [array]) { $row[$c] = ($v -join ' | ') } else { $row[$c] = [string]$v } }
             }
         }
@@ -2509,7 +2867,7 @@ function Set-Busy {
     $script:progress.Style = if ($Busy) { 'Marquee' } else { 'Blocks' }
     $script:progress.Visible = $Busy
     $script:btnCancel.Enabled = $Busy
-    foreach ($c in @($script:btnConnect, $script:cboDb, $script:btnFragLimited, $script:btnFragSampled, $script:btnRefreshTable, $script:btnProcLoad, $script:btnProcAnalyze, $script:btnProcFrag, $script:cboProcPlan)) { if ($c) { $c.Enabled = -not $Busy } }
+    foreach ($c in @($script:btnConnect, $script:cboDb, $script:btnFragLimited, $script:btnFragSampled, $script:btnRefreshTable, $script:btnProcLoad, $script:btnProcAnalyze, $script:btnProcFrag, $script:cboProcPlan, $script:btnFind, $script:btnFoundAnalyze)) { if ($c) { $c.Enabled = -not $Busy } }
     $script:form.Cursor = if ($Busy) { [System.Windows.Forms.Cursors]::AppStarting } else { [System.Windows.Forms.Cursors]::Default }
 }
 
@@ -2942,7 +3300,10 @@ function Clear-ProcViews {
     foreach ($g in @($script:gridProcFindings, $script:gridProcStmts)) { if ($g) { $g.DataSource = $null } }
     foreach ($t in @($script:txtProcSummary, $script:txtProcFinding, $script:txtProcStmt, $script:txtPlanXml)) { if ($t) { $t.Text = '' } }
     if ($script:cboProcPlan) { $script:State.ProcPlanSuppress = $true; $script:cboProcPlan.Items.Clear(); $script:State.ProcPlanSuppress = $false }
-    if ($script:lblProcCount) { $script:lblProcCount.Text = 'Click "Load procedures" to list the procedures of this database (metadata only).' }
+    if ($script:lblProcCount) { $script:lblProcCount.Text = 'Click "Load modules" to list the procedures, functions and triggers of this database (metadata only).' }
+    $script:State.FoundItems = @(); $script:State.QueryItem = $null; $script:State.AnalysisKind = $null
+    if ($script:gridFound) { $script:gridFound.DataSource = $null }
+    if ($script:lblFindInfo) { $script:lblFindInfo.Text = '' }
 }
 
 function Invoke-ProcedureListLoad {
@@ -3013,28 +3374,100 @@ function Update-ProcFilter {
 }
 
 function Invoke-ProcAnalysis {
-    param([string]$SourceKey)
-    $row = $script:gridProcs.CurrentRow
-    $oid = $null; $name = $null
-    if ($SourceKey -and $script:State.ProcObjectId) { $oid = [int]$script:State.ProcObjectId; $name = $script:State.ProcName }
-    elseif ($row) { $oid = [int]$row.Cells['ObjectId'].Value; $name = "[$($row.Cells['SchemaName'].Value)].[$($row.Cells['ProcName'].Value)]" }
-    if (-not $oid) { Set-Status 'Pick a procedure in the list first.'; return }
-    [void](Start-AnalyzerJob -Status "Reading the existing plan of $name" -Arguments @{ Ctx = $script:State.DbContext; ObjectId = $oid; Info = $script:State.ServerInfo; Db = $script:State.DbInfo; Key = $SourceKey; Name = $name } -Work {
+    param([string]$SourceKey, [int]$ObjectId, [string]$Name)
+    $oid = $null; $nm = $null
+    if ($ObjectId) { $oid = $ObjectId; $nm = $Name }
+    elseif ($SourceKey -and $script:State.ProcObjectId) { $oid = [int]$script:State.ProcObjectId; $nm = $script:State.ProcName }
+    else {
+        $row = $script:gridProcs.CurrentRow
+        if ($row) { $oid = [int]$row.Cells['ObjectId'].Value; $nm = "[$($row.Cells['SchemaName'].Value)].[$($row.Cells['ProcName'].Value)]" }
+    }
+    if (-not $oid) { Set-Status 'Pick a procedure, function or trigger in the Modules list first.'; return }
+    [void](Start-AnalyzerJob -Status "Reading the existing plan of $nm" -Arguments @{ Ctx = $script:State.DbContext; ObjectId = $oid; Info = $script:State.ServerInfo; Db = $script:State.DbInfo; Key = $SourceKey; Name = $nm } -Work {
         param($Ctx, $ObjectId, $Info, $Db, $Key, $Name)
         $ErrorActionPreference = 'Stop'
         @{ Analysis = (Invoke-ProcedureAnalysis -Context $Ctx -ObjectId $ObjectId -ServerInfo $Info -DatabaseInfo $Db -SourceKey $Key); Name = $Name; ObjectId = $ObjectId }
     } -OnDone {
         param($r)
-        $script:State.ProcAnalysis = $r.Analysis; $script:State.ProcName = $r.Name; $script:State.ProcObjectId = $r.ObjectId
-        $script:State.ProcPlanSuppress = $true
-        $script:cboProcPlan.Items.Clear()
-        $sel = -1; $k = 0
-        foreach ($s in @($r.Analysis.Sources)) { [void]$script:cboProcPlan.Items.Add($s.Label); if ($r.Analysis.Source -and $s.Key -eq $r.Analysis.Source.Key) { $sel = $k }; $k++ }
-        if ($sel -ge 0) { $script:cboProcPlan.SelectedIndex = $sel }
-        $script:State.ProcPlanSuppress = $false
-        Update-ProcFindings
-        $script:procTabs.SelectedIndex = 0
+        $script:State.AnalysisKind = 'Module'; $script:State.QueryItem = $null
+        $script:State.ProcObjectId = $r.ObjectId
+        Show-AnalysisResult -Analysis $r.Analysis -Name $r.Name
     })
+}
+
+function Show-AnalysisResult {
+    param($Analysis, [string]$Name)
+    $script:State.ProcAnalysis = $Analysis; $script:State.ProcName = $Name
+    $script:State.ProcPlanSuppress = $true
+    $script:cboProcPlan.Items.Clear()
+    $sel = -1; $k = 0
+    foreach ($s in @($Analysis.Sources)) { [void]$script:cboProcPlan.Items.Add($s.Label); if ($Analysis.Source -and $s.Key -eq $Analysis.Source.Key) { $sel = $k }; $k++ }
+    if ($sel -ge 0) { $script:cboProcPlan.SelectedIndex = $sel }
+    $script:State.ProcPlanSuppress = $false
+    Update-ProcFindings
+    $script:procTabs.SelectedIndex = 0
+}
+
+function Invoke-FindQuery {
+    if (-not $script:State.DbContext) { Set-Status 'Pick a database first (Query Store is searched in that database; the plan cache is server-wide).'; return }
+    $modes = @{ 0 = 'Text'; 1 = 'QueryHash'; 2 = 'QueryPlanHash'; 3 = 'QueryId'; 4 = 'PlanHandle' }
+    $mode = $modes[[int]$script:cboFindMode.SelectedIndex]
+    $val = $script:txtFind.Text.Trim()
+    if (-not $val) { Set-Status 'Type what to search for.'; return }
+    if (-not $script:chkFindCache.Checked -and -not $script:chkFindQS.Checked) { Set-Status 'Tick Plan cache and/or Query Store.'; return }
+    [void](Start-AnalyzerJob -Status "Finding queries ($mode)" -Arguments @{ Ctx = $script:State.DbContext; Mode = $mode; Value = $val; Info = $script:State.ServerInfo; Settings = $script:Settings; Env = $script:State.Environment; C = [bool]$script:chkFindCache.Checked; Q = [bool]$script:chkFindQS.Checked } -Work {
+        param($Ctx, $Mode, $Value, $Info, $Settings, $Env, $C, $Q)
+        $ErrorActionPreference = 'Stop'
+        @{ Found = (Find-QueryPlans -Context $Ctx -Mode $Mode -Value $Value -ServerInfo $Info -Settings $Settings -Environment $Env -PlanCache $C -QueryStore $Q) }
+    } -OnDone {
+        param($r)
+        $items = @($r.Found.Items)
+        $k = 0
+        $rows = foreach ($it in $items) {
+            $txt = ([string]$it.StatementText) -replace '\s+', ' '; if ($txt.Length -gt 300) { $txt = $txt.Substring(0, 300) + '...' }
+            [pscustomobject]@{ Source = $it.Source; Database = $it.DatabaseName; Object = $it.ObjectName; Executions = $it.Executions; AvgElapsedMs = $it.AvgElapsedMs; AvgCpuMs = $it.AvgCpuMs
+                AvgLogicalReads = $it.AvgLogicalReads; AvgRows = $it.AvgRows; Plans = $it.PlanCount; LastExecution = $it.LastExecution; QueryHash = $it.QueryHash; QueryId = $it.QueryId; Text = $txt; Idx = $k }
+            $k++
+        }
+        $script:State.FoundItems = $items
+        $script:gridFound.DataSource = New-GridTable -Items @($rows) -Columns 'Source', 'Database', 'Object', 'Executions', 'AvgElapsedMs', 'AvgCpuMs', 'AvgLogicalReads', 'AvgRows', 'Plans', 'LastExecution', 'QueryHash', 'QueryId', 'Text', 'Idx'
+        $script:lblFindInfo.Text = ("{0} match(es) (top 50 per source, most recent first). {1}" -f $items.Count, ($r.Found.Warnings -join ' '))
+    })
+}
+
+function Invoke-FoundAnalysis {
+    param([string]$SourceKey)
+    $item = $null
+    if ($SourceKey -and $script:State.QueryItem) { $item = $script:State.QueryItem }
+    else {
+        $row = $script:gridFound.CurrentRow
+        if ($row) { $item = $script:State.FoundItems[[int]$row.Cells['Idx'].Value] }
+    }
+    if (-not $item) { Set-Status 'Pick a query in the Find query results first.'; return }
+    $label = if ($item.Source -eq 'Query Store') { "Query Store query_id $($item.QueryId) ($($item.QueryHash))" } else { "Query $($item.QueryHash) (plan cache$(if ($item.DatabaseName) { ", $($item.DatabaseName)" }))" }
+    [void](Start-AnalyzerJob -Status "Reading the existing plan of $label" -Arguments @{ Ctx = $script:State.DbContext; Item = $item; Info = $script:State.ServerInfo; Db = $script:State.DbInfo; Settings = $script:Settings; Key = $SourceKey; Name = $label } -Work {
+        param($Ctx, $Item, $Info, $Db, $Settings, $Key, $Name)
+        $ErrorActionPreference = 'Stop'
+        @{ Analysis = (Invoke-QueryAnalysis -Context $Ctx -Item $Item -ServerInfo $Info -DatabaseInfo $Db -Settings $Settings -SourceKey $Key); Name = $Name; Item = $Item }
+    } -OnDone {
+        param($r)
+        $script:State.AnalysisKind = 'Query'; $script:State.QueryItem = $r.Item; $script:State.ProcObjectId = $null
+        Show-AnalysisResult -Analysis $r.Analysis -Name $r.Name
+    })
+}
+
+function Invoke-FindingFollowUp {
+    # double-click on a finding: analyze the called module, or search for the dynamic SQL
+    $row = $script:gridProcFindings.CurrentRow
+    if (-not $row -or -not $script:State.ProcFindings) { return }
+    $f = $script:State.ProcFindings[[int]$row.Cells['Idx'].Value]
+    if ($f.PSObject.Properties['CalledObjectId'] -and $f.CalledObjectId) { Invoke-ProcAnalysis -ObjectId ([int]$f.CalledObjectId) -Name $f.CalledName; return }
+    if ($f.PSObject.Properties['SuggestedSearch']) {
+        $script:leftTabs.SelectedTab = $script:tabFind
+        $script:cboFindMode.SelectedIndex = 0
+        if ($f.SuggestedSearch) { $script:txtFind.Text = $f.SuggestedSearch; Invoke-FindQuery }
+        else { $script:txtFind.Focus(); Set-Status 'Type a distinctive piece of the dynamic SQL text (6+ characters) and click Find.' }
+    }
 }
 
 function Get-ProcFragLookup {
@@ -3076,10 +3509,14 @@ function Update-ProcFindings {
             $rt = $null; if ($st.PSObject.Properties['Runtime']) { $rt = $st.Runtime }
             $mis = $null; if ($st.PSObject.Properties['MisestimateRatio']) { $mis = $st.MisestimateRatio }
             $txt = [string]$st.Text; $short = ($txt -replace '\s+', ' '); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) + '...' }
+            # Windows PowerShell 5.1: an if without else inside a hashtable literal yields an empty object, not $null,
+            # so runtime values are copied explicitly.
+            $avgRows = $null; $minRows = $null; $maxRows = $null; $execs = $null; $cpu = $null; $ela = $null; $reads = $null
+            if ($rt) { $avgRows = $rt.AvgRows; $minRows = $rt.MinRows; $maxRows = $rt.MaxRows; $execs = $rt.Executions; $cpu = $rt.AvgCpuMs; $ela = $rt.AvgElapsedMs; $reads = $rt.AvgLogicalReads }
             $stmts += [pscustomobject]@{
                 Key = $st.Key; Statement = $st.StatementId; Type = $st.Type; EstRows = $st.EstRows
-                AvgRows = $(if ($rt) { $rt.AvgRows }); MinRows = $(if ($rt) { $rt.MinRows }); MaxRows = $(if ($rt) { $rt.MaxRows }); EstimateOffBy = $mis
-                Executions = $(if ($rt) { $rt.Executions }); AvgCpuMs = $(if ($rt) { $rt.AvgCpuMs }); AvgElapsedMs = $(if ($rt) { $rt.AvgElapsedMs }); AvgLogicalReads = $(if ($rt) { $rt.AvgLogicalReads })
+                AvgRows = $avgRows; MinRows = $minRows; MaxRows = $maxRows; EstimateOffBy = $mis
+                Executions = $execs; AvgCpuMs = $cpu; AvgElapsedMs = $ela; AvgLogicalReads = $reads
                 Cost = $st.Cost; Tables = (@($st.Tables) -join ', '); Text = $short; Doc = $st.DocIndex
             }
         }
@@ -3671,6 +4108,16 @@ PROCEDURE ANALYSIS (opt-in tab)
     missing-index hints, key lookups, and parameter sensitivity (very different row counts per execution).
   Scripts go to the Script tab as text. "Save as .sqlplan" opens the plan in SSMS or Plan Explorer.
   If the procedure has no cached plan and Query Store has none, run it normally once; the tool won't.
+  IF/ELSE: statements in branches that have not run since the plan was cached have no runtime numbers;
+  they are listed as "not run since cached", not as missing history.
+  DYNAMIC SQL (sp_executesql / EXEC(@sql)) is compiled and cached on its own, so it is not part of the
+  procedure's plan. The tool detects it (plan and definition), suggests a text fragment, and a double-click
+  on that finding searches for it. Nested procedures, scalar UDFs and multi-statement TVFs are listed too:
+  double-click to analyze them.
+  FIND QUERY searches by SQL text, query hash, query plan hash, Query Store query_id or plan handle:
+  plan cache server-wide, Query Store in the current database (top 50 each, MAXDOP 1). A plan-cache text
+  search is skipped while the server is busy. Query Store queries with several plans show them all in the
+  Plan picker, and a big duration spread between plans is flagged as a plan regression.
 
 PRIORITY
   High / Medium / Low are scores (0-100) built from: changes vs the auto-update threshold, sample
@@ -3681,21 +4128,42 @@ PRIORITY
 $tabHelp.Controls.Add($txtHelp)
 
 # Procedure analysis tab (opt-in: nothing runs until a button is clicked)
-$script:tabProc = New-Ctl TabPage @{ Text = 'Procedure analysis' }
+$script:tabProc = New-Ctl TabPage @{ Text = 'Procedure / query analysis' }
 $procTop = New-Ctl FlowLayoutPanel @{ Dock = 'Top'; Height = 36; Padding = (New-Object System.Windows.Forms.Padding(4)); WrapContents = $false }
-$script:btnProcLoad = New-Ctl Button @{ Text = 'Load procedures'; Width = 130; Height = 26 }
+$script:btnProcLoad = New-Ctl Button @{ Text = 'Load modules'; Width = 130; Height = 26 }
 $script:txtProcSearch = New-Ctl TextBox @{ Width = 240; Margin = (New-Object System.Windows.Forms.Padding(8, 4, 0, 0)) }
 $script:chkProcForTable = New-Ctl CheckBox @{ Text = 'Only procedures that use the selected table'; AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(10, 6, 0, 0)) }
 $procTop.Controls.AddRange(@($script:btnProcLoad, $script:txtProcSearch, $script:chkProcForTable))
 $tip.SetToolTip($script:txtProcSearch, 'Search procedures: partial names, typos, abbreviations, * wildcards, schema.name')
 $script:lblProcCount = New-Ctl Label @{ Dock = 'Top'; Height = 20; ForeColor = [System.Drawing.Color]::DimGray }
 $procInfo = New-Ctl Label @{ Dock = 'Top'; Height = 34; ForeColor = [System.Drawing.Color]::DarkGreen
-    Text = 'Opt-in. Reads the plan the procedure ALREADY has (plan cache, or Query Store). The procedure is never executed or compiled. From that plan it shows which statistics and indexes this procedure depends on, and whether updating or rebuilding them would help it.' }
+    Text = 'Opt-in. Reads plans that ALREADY exist (plan cache or Query Store) for a procedure, function or trigger, or for any query you find by text, query hash, plan hash, Query Store query_id or plan handle (dynamic SQL included). Nothing is executed or compiled.' }
 
 $script:procSplit = New-Ctl SplitContainer @{ Dock = 'Fill'; FixedPanel = 'Panel1' }
 $script:gridProcs = New-Grid; $script:gridProcs.MultiSelect = $false
 $script:btnProcAnalyze = New-Ctl Button @{ Dock = 'Bottom'; Height = 30; Text = 'Analyze selected procedure (reads its cached plan)'; BackColor = [System.Drawing.Color]::FromArgb(225, 238, 255) }
-$script:procSplit.Panel1.Controls.Add($script:gridProcs); $script:procSplit.Panel1.Controls.Add($script:btnProcAnalyze)
+$script:leftTabs = New-Ctl TabControl @{ Dock = 'Fill' }
+$tabModules = New-Ctl TabPage @{ Text = 'Modules' }
+$tabModules.Controls.Add($script:gridProcs); $tabModules.Controls.Add($script:btnProcAnalyze)
+$script:tabFind = New-Ctl TabPage @{ Text = 'Find query' }
+$findTop = New-Ctl Panel @{ Dock = 'Top'; Height = 112 }
+$findTop.Controls.Add((New-Ctl Label @{ Text = 'Search by:'; Left = 4; Top = 8; AutoSize = $true }))
+$script:cboFindMode = New-Ctl ComboBox @{ Left = 70; Top = 4; Width = 240; DropDownStyle = 'DropDownList' }
+[void]$script:cboFindMode.Items.AddRange(@('SQL text contains (6+ characters)', 'Query hash (0x + 16 hex)', 'Query plan hash (0x + 16 hex)', 'Query Store query_id', 'Plan handle (0x...)'))
+$script:cboFindMode.SelectedIndex = 0
+$script:txtFind = New-Ctl TextBox @{ Left = 4; Top = 32; Width = 306; Font = $script:Mono }
+$script:chkFindCache = New-Ctl CheckBox @{ Text = 'Plan cache (all databases)'; Left = 4; Top = 58; AutoSize = $true; Checked = $true }
+$script:chkFindQS = New-Ctl CheckBox @{ Text = 'Query Store (this database)'; Left = 170; Top = 58; AutoSize = $true; Checked = $true }
+$script:btnFind = New-Ctl Button @{ Text = 'Find'; Left = 4; Top = 82; Width = 80; Height = 26 }
+$findTop.Controls.AddRange(@($script:cboFindMode, $script:txtFind, $script:chkFindCache, $script:chkFindQS, $script:btnFind))
+$tip.SetToolTip($script:txtFind, 'Text: a distinctive piece of the statement (e.g. from the dynamic SQL). Hashes come from sys.dm_exec_query_stats, Query Store or a plan''s QueryHash / QueryPlanHash attribute.')
+$tip.SetToolTip($script:btnFind, 'Read-only, top 50 per source, MAXDOP 1. A plan cache text search is skipped while the server is busy.')
+$script:lblFindInfo = New-Ctl Label @{ Dock = 'Top'; Height = 34; ForeColor = [System.Drawing.Color]::DimGray }
+$script:gridFound = New-Grid; $script:gridFound.MultiSelect = $false
+$script:btnFoundAnalyze = New-Ctl Button @{ Dock = 'Bottom'; Height = 30; Text = 'Analyze selected query (reads its plan)'; BackColor = [System.Drawing.Color]::FromArgb(225, 238, 255) }
+$script:tabFind.Controls.Add($script:gridFound); $script:tabFind.Controls.Add($script:btnFoundAnalyze); $script:tabFind.Controls.Add($script:lblFindInfo); $script:tabFind.Controls.Add($findTop)
+$script:leftTabs.TabPages.AddRange(@($tabModules, $script:tabFind))
+$script:procSplit.Panel1.Controls.Add($script:leftTabs)
 
 $procTools = New-Ctl FlowLayoutPanel @{ Dock = 'Top'; Height = 66; Padding = (New-Object System.Windows.Forms.Padding(4)) }
 $procTools.Controls.Add((New-Ctl Label @{ Text = 'Plan:'; AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(0, 7, 2, 0)) }))
@@ -3875,7 +4343,8 @@ $script:gridProcs.add_DataBindingComplete({
     Set-GridFormats $s
     if ($s.Columns.Contains('ObjectId')) { $s.Columns['ObjectId'].Visible = $false }
     if ($s.Columns.Contains('SchemaName')) { $s.Columns['SchemaName'].Width = 60; $s.Columns['SchemaName'].HeaderText = 'Schema' }
-    if ($s.Columns.Contains('ProcName')) { $s.Columns['ProcName'].Width = 220; $s.Columns['ProcName'].HeaderText = 'Procedure' }
+    if ($s.Columns.Contains('ProcName')) { $s.Columns['ProcName'].Width = 200; $s.Columns['ProcName'].HeaderText = 'Name' }
+    if ($s.Columns.Contains('Kind')) { $s.Columns['Kind'].Width = 110 }
     $s.ClearSelection()
 })
 $script:gridProcs.add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { Invoke-ProcAnalysis } })
@@ -3886,8 +4355,14 @@ $script:cboProcPlan.add_SelectedIndexChanged({
     $src = @($script:State.ProcAnalysis.Sources)
     if ($i -lt 0 -or $i -ge $src.Count) { return }
     if ($script:State.ProcAnalysis.Source -and $src[$i].Key -eq $script:State.ProcAnalysis.Source.Key) { return }
-    Invoke-ProcAnalysis -SourceKey $src[$i].Key
+    if ($script:State.AnalysisKind -eq 'Query') { Invoke-FoundAnalysis -SourceKey $src[$i].Key } else { Invoke-ProcAnalysis -SourceKey $src[$i].Key }
 })
+$script:gridProcFindings.add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { Invoke-FindingFollowUp } })
+$script:btnFind.add_Click({ Invoke-FindQuery })
+$script:txtFind.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Invoke-FindQuery } })
+$script:gridFound.add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { Invoke-FoundAnalysis } })
+$script:btnFoundAnalyze.add_Click({ Invoke-FoundAnalysis })
+$script:gridFound.add_DataBindingComplete({ param($s, $e) Set-GridFormats $s; if ($s.Columns.Contains('Idx')) { $s.Columns['Idx'].Visible = $false }; if ($s.Columns.Contains('Text')) { $s.Columns['Text'].Width = 500 }; if ($s.Columns.Contains('QueryHash')) { $s.Columns['QueryHash'].Width = 150 }; $s.ClearSelection() })
 foreach ($g in @($script:gridProcFindings, $script:gridProcStmts)) { $g.add_DataBindingComplete({ param($s, $e) Set-GridFormats $s; foreach ($h in 'Idx', 'Key', 'Doc') { if ($s.Columns.Contains($h)) { $s.Columns[$h].Visible = $false } }; if ($s.Columns.Contains('Finding')) { $s.Columns['Finding'].Width = 700 }; if ($s.Columns.Contains('Text')) { $s.Columns['Text'].Width = 600 }; if ($s.Columns.Contains('Action')) { $s.Columns['Action'].Width = 260 }; if ($s.Columns.Contains('Object')) { $s.Columns['Object'].Width = 200 }; if ($s.Columns.Contains('EstimateOffBy')) { $s.Columns['EstimateOffBy'].DefaultCellStyle.Format = 'N1'; $s.Columns['EstimateOffBy'].HeaderText = 'Off by (x)' } }) }
 $script:gridProcFindings.add_SelectionChanged({ Show-ProcFindingDetail })
 $script:gridProcStmts.add_SelectionChanged({
