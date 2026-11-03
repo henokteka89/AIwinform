@@ -77,3 +77,9 @@ The tool explains exit codes. For example, `0x84BE0BC2` means *a Windows restart
 ## Files
 - **Tool log:** `%ProgramData%\SqlPatchGui\logs\SqlPatchGui_<timestamp>.log`
 - **Last-used values:** `%APPDATA%\SqlPatchGui\settings.json`
+
+## Multi-server pipeline
+For patching many servers on a schedule (AG- and FCI-aware, one replica per run, driven by a `DBAPatch` control database), see [`pipeline/`](pipeline/README.md):
+- `Invoke-SqlPatch.ps1`: entry point (Discover / Download / Plan / Patch)
+- `module/SqlPatch.psm1`: pipeline logic (dbatools)
+- `sql/01_PatchControl.sql`, `sql/02_SampleInventory.sql`: control database and example inventory
