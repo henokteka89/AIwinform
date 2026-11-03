@@ -41,30 +41,36 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\SqlIndexStatsAnal
 7. **Missing indexes**: the optimizer's requests, with a commented-out CREATE INDEX and a reminder to check overlaps first.
 8. **Generate script...** (Indexes or Statistics tab): choose REBUILD or REORGANIZE, ONLINE, WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF), RESUMABLE + MAX_DURATION, SORT_IN_TEMPDB, MAXDOP, a single PARTITION, LOB_COMPACTION, and COMPRESS_ALL_ROW_GROUPS. For statistics: FULLSCAN / SAMPLE n PERCENT / RESAMPLE [ON PARTITIONS], MAXDOP, and PERSIST_SAMPLE_PERCENT. The preview updates live. Production defaults are ONLINE + low-priority wait + resumable where available. You can optionally add the equivalent **Ola Hallengren IndexOptimize** call (the tool detects whether IndexOptimize is installed). Copy or save the result as `.sql`.
 
-## Procedure analysis (opt-in tab)
-Nothing runs until you click.
+## Procedure / query analysis (opt-in tab)
+Nothing runs until you click. Everything reads plans that **already exist** (plan cache or Query Store). Nothing is executed, compiled or recompiled.
 
-1. **Load procedures** lists them from `sys.procedures` (metadata only). The list has the same fuzzy search as tables. Tick **Only procedures that use the selected table** to filter by `sys.sql_expression_dependencies`.
-2. **Analyze** reads the plan the procedure **already has**. It never executes, compiles or recompiles the procedure, and never requests an estimated or actual plan.
-   - It reads the cached plan via `sys.dm_exec_procedure_stats` and `sys.dm_exec_text_query_plan` (the text version avoids the XML nesting limit), with per-statement runtime figures from `sys.dm_exec_query_stats`.
-   - If the plan isn't cached, it falls back to Query Store (2016+, when enabled): the latest plan per statement plus runtime stats.
-   - When there are several cached plans (different SET options), a picker lets you switch between them.
-3. **Findings**, ranked:
-   - **Statistics the optimizer used.** SQL 2017 and 2016 SP2+ record them in the plan (`OptimizerStatsUsage`). Each is scored against its *current* freshness and sample, gets +10 for being used by this plan, and +20 when a statement on that table has a row estimate ≥10x off its real average row count. On older versions, all stats on the tables the plan reads are assessed, and only Medium or higher are listed.
-   - **Columns with no statistics:** High. A commented-out `CREATE STATISTICS` is provided.
-   - **Index maintenance only where it can help:** an index the plan **scans** is offered a LIMITED fragmentation check (button, same size caps and busy-server refusal as elsewhere). REBUILD or REORGANIZE is suggested only once it measures as fragmented or with low page density. Seek-only indexes are reported as "no action", because fragmentation barely affects seeks.
-   - **Not maintenance problems** (these are called out so you don't rebuild for nothing):
-     - scans that read 100x or more rows than they return (an indexing gap)
-     - key lookups of 1,000 or more per execution (a covering index candidate)
-     - missing-index hints
-     - implicit conversions that prevent seeks
-     - tempdb spills
-     - missing join predicates
-     - parameter sensitivity: rows per execution varying 100x or more, where a stats update or rebuild won't fix it
-   - The summary shows the parameter values the plan was compiled for.
-4. **Scripts:** *Script statistics updates* uses the selected rows, or all High/Medium statistics, with each statistic's suggested FULLSCAN/SAMPLE. *Script index maintenance* uses the selected rows, or all REBUILD/REORGANIZE rows, with production-safe defaults. Both go to the Script tab as text with the usual safety header. **Save as .sqlplan** opens the plan in SSMS or Plan Explorer.
+**Modules** (left tab)
+- **Load modules** lists procedures, scalar functions, multi-statement TVFs and triggers (metadata only).
+- **Only procedures that use the selected table** filters the list using `sys.sql_expression_dependencies`.
+- **Analyze** reads the module's cached plan from `dm_exec_procedure_stats`, `dm_exec_function_stats` (2016+) or `dm_exec_trigger_stats`, via `dm_exec_text_query_plan`. Per-statement runtime comes from `dm_exec_query_stats`. If the plan isn't cached, it falls back to Query Store.
 
-Every one of these queries passes the same read-only guard. Plan XML is parsed with DTD processing and external resolution disabled.
+**Find query** (left tab): search by **SQL text**, **query hash**, **query plan hash**, **Query Store query_id** or **plan handle**.
+- The plan cache is searched across the whole server: ad hoc, prepared and dynamic SQL included.
+- Query Store is searched in the current database.
+- Each source returns the top 50 matches, at MAXDOP 1, with the values passed as parameters.
+- A plan-cache text search needs at least 6 characters and is skipped while the server is busy.
+- For a Query Store query, every plan it has had appears in the **Plan** picker. A large duration spread between plans is flagged as a plan regression.
+
+**What the analysis covers**
+- **Every statement kind**, including the IF/WHILE condition's own query (`StmtCond`) and cursors. Statements in branches that haven't run since the plan was cached (IF/ELSE not taken, early RETURN) are listed as *not run since cached*, not as missing history. Runtime numbers are matched by query hash, falling back to the statement text.
+- **Statistics the optimizer used** (recorded in plans from SQL 2017 and 2016 SP2). Each is scored on its current freshness and sample, and rises in priority when that statement's row estimate is 10x or more off. On older versions, the stats of the tables the plan reads are assessed instead. Columns with no statistics are High.
+- **Index maintenance only where it helps:** only indexes the plan **scans**, and only after a LIMITED fragmentation check (button) shows fragmentation or low page density. Seek-only indexes are "no action".
+- **Dynamic SQL** (`sp_executesql`, `EXEC(@sql)`) is found from the plan and from the module definition. These statements are cached on their own, so the finding suggests a text fragment. Double-click it to search for them.
+- **Nested procedures, scalar UDFs and multi-statement TVFs** are listed. Double-click one to analyze it next.
+- **Problems maintenance won't fix:**
+  - scans that read 100x or more rows than they return
+  - heavy key lookups and missing-index hints
+  - implicit conversions that prevent seeks
+  - tempdb spills and missing join predicates
+  - parameter sensitivity, with the compiled parameter values shown
+- **Scripts:** statistics updates and REBUILD/REORGANIZE go to the Script tab as text, with the safety header. **Save as .sqlplan** opens the plan in SSMS or Plan Explorer.
+
+Plan XML is parsed with DTD processing and external resolution disabled. Every query passes the read-only guard.
 
 ## How priorities are scored (0-100, heuristics, not orders)
 **Statistics**
