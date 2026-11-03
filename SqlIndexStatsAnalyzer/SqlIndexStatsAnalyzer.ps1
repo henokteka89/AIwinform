@@ -2725,26 +2725,36 @@ function Get-ColumnType {
     [string]
 }
 
+function ConvertTo-GridValue {
+    # unwrap PSObject; DBNull and empty objects (Windows PowerShell 5.1's "nothing" inside literals) become $null
+    param($Value)
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $null }
+    if ($Value -is [psobject]) { $Value = $Value.psobject.BaseObject }
+    if ($Value -is [System.Management.Automation.PSCustomObject] -and @($Value.psobject.Properties).Count -eq 0) { return $null }
+    if ($Value -is [string] -or $Value -is [ValueType] -or $Value -is [array]) { return ,$Value }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) { return [string]$Value }
+    ,$Value
+}
+
 function New-GridTable {
     param([object[]]$Items, [string[]]$Columns)
     $dt = New-Object System.Data.DataTable
     $types = @{}
     foreach ($c in $Columns) {
         $t = [string]
-        foreach ($it in $Items) { $v = $it.$c; if ($null -ne $v -and -not ($v -is [DBNull])) { $t = Get-ColumnType $v; break } }
+        foreach ($it in $Items) { $v = ConvertTo-GridValue $it.$c; if ($null -ne $v) { $t = Get-ColumnType $v; break } }
         $types[$c] = $t
         [void]$dt.Columns.Add($c, $t)
     }
     foreach ($it in $Items) {
         $row = $dt.NewRow()
         foreach ($c in $Columns) {
-            $v = $it.$c
-            if ($v -is [psobject]) { $v = $v.psobject.BaseObject }
-            if ($null -eq $v -or $v -is [DBNull]) { $row[$c] = [DBNull]::Value; continue }
+            $v = ConvertTo-GridValue $it.$c
+            if ($null -eq $v) { $row[$c] = [DBNull]::Value; continue }
             switch ($types[$c].Name) {
-                'Double'   { $row[$c] = [double]$v }
-                'DateTime' { $row[$c] = [datetime]$v }
-                'Boolean'  { $row[$c] = [bool]$v }
+                'Double'   { try { $row[$c] = [double]$v } catch { $row[$c] = [DBNull]::Value } }
+                'DateTime' { try { $row[$c] = [datetime]$v } catch { $row[$c] = [DBNull]::Value } }
+                'Boolean'  { try { $row[$c] = [bool]$v } catch { $row[$c] = [DBNull]::Value } }
                 default    { if ($v -is [array]) { $row[$c] = ($v -join ' | ') } else { $row[$c] = [string]$v } }
             }
         }
@@ -3499,10 +3509,14 @@ function Update-ProcFindings {
             $rt = $null; if ($st.PSObject.Properties['Runtime']) { $rt = $st.Runtime }
             $mis = $null; if ($st.PSObject.Properties['MisestimateRatio']) { $mis = $st.MisestimateRatio }
             $txt = [string]$st.Text; $short = ($txt -replace '\s+', ' '); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) + '...' }
+            # Windows PowerShell 5.1: an if without else inside a hashtable literal yields an empty object, not $null,
+            # so runtime values are copied explicitly.
+            $avgRows = $null; $minRows = $null; $maxRows = $null; $execs = $null; $cpu = $null; $ela = $null; $reads = $null
+            if ($rt) { $avgRows = $rt.AvgRows; $minRows = $rt.MinRows; $maxRows = $rt.MaxRows; $execs = $rt.Executions; $cpu = $rt.AvgCpuMs; $ela = $rt.AvgElapsedMs; $reads = $rt.AvgLogicalReads }
             $stmts += [pscustomobject]@{
                 Key = $st.Key; Statement = $st.StatementId; Type = $st.Type; EstRows = $st.EstRows
-                AvgRows = $(if ($rt) { $rt.AvgRows }); MinRows = $(if ($rt) { $rt.MinRows }); MaxRows = $(if ($rt) { $rt.MaxRows }); EstimateOffBy = $mis
-                Executions = $(if ($rt) { $rt.Executions }); AvgCpuMs = $(if ($rt) { $rt.AvgCpuMs }); AvgElapsedMs = $(if ($rt) { $rt.AvgElapsedMs }); AvgLogicalReads = $(if ($rt) { $rt.AvgLogicalReads })
+                AvgRows = $avgRows; MinRows = $minRows; MaxRows = $maxRows; EstimateOffBy = $mis
+                Executions = $execs; AvgCpuMs = $cpu; AvgElapsedMs = $ela; AvgLogicalReads = $reads
                 Cost = $st.Cost; Tables = (@($st.Tables) -join ', '); Text = $short; Doc = $st.DocIndex
             }
         }
