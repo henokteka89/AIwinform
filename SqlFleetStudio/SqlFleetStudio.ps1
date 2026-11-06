@@ -358,6 +358,14 @@ function Write-JsonFile([string]$Path, $Object) {
     Move-Item -Path $tmp -Destination $Path -Force
 }
 
+# Windows PowerShell 5.1 can throw "Argument types do not match" on @() around .NET generic
+# collections (List[T], HashSet[T], dictionary key/value collections). Copy them explicitly instead.
+function ConvertTo-PlainArray($Collection) {
+    $list = New-Object System.Collections.ArrayList
+    if ($null -ne $Collection) { foreach ($x in $Collection) { [void]$list.Add($x) } }
+    , $list.ToArray()
+}
+
 function ConvertTo-CrLf([string]$s) {
     if ($null -eq $s) { return '' }
     ($s -replace "`r`n", "`n") -replace "`n", "`r`n"
@@ -436,9 +444,9 @@ function Save-ServerCache {
         RefreshedAt = $State.RefreshedAt
         Source      = $State.Source
         Columns     = @($State.Columns)
-        Servers     = @($State.Servers)
-        Manual      = @($State.Manual)
-        Checked     = @($State.Checked)
+        Servers     = (ConvertTo-PlainArray $State.Servers)
+        Manual      = (ConvertTo-PlainArray $State.Manual)
+        Checked     = (ConvertTo-PlainArray $State.Checked)
     }
     Write-JsonFile $Paths.Servers $obj
 }
@@ -548,7 +556,10 @@ function Load-Library {
     }
 }
 
-function Save-Library { Write-JsonFile $Paths.Library @($State.Library) }
+function Save-Library {
+    $items = ConvertTo-PlainArray $State.Library
+    Write-JsonFile $Paths.Library $items
+}
 
 function Find-LibEntry([string]$Id) {
     foreach ($q in $State.Library) { if ($q.Id -eq $Id) { return $q } }
@@ -1135,7 +1146,7 @@ function Resize-GridColumns($g) {
 
 function Reset-Results($Servers) {
     if ($State.ResultMap) {
-        foreach ($e in @($State.ResultMap.Values)) {
+        foreach ($e in (ConvertTo-PlainArray $State.ResultMap.Values)) {
             $tabResults.TabPages.Remove($e.Tab)
             $e.Grid.DataSource = $null
             $e.Tab.Dispose()
@@ -1216,7 +1227,7 @@ function Complete-Job($Job, $Res) {
     foreach ($m in $Res.Messages) { [void]$sb.AppendLine([string]$m) }
     if ($Res.Error) { [void]$sb.AppendLine($Res.Error) }
     Add-Message $sb.ToString()
-    foreach ($dt in @($Res.Tables)) { Add-ResultTable $dt }
+    foreach ($dt in (ConvertTo-PlainArray $Res.Tables)) { Add-ResultTable $dt }
 }
 
 # ------------------------------------------------------------------ execution
@@ -1357,7 +1368,7 @@ function Complete-Execution {
 function Stop-Execution {
     if (-not $State.Running) { return }
     $State.Shared['__cancel'] = $true
-    foreach ($k in @($State.Shared.Keys)) {
+    foreach ($k in (ConvertTo-PlainArray $State.Shared.Keys)) {
         $v = $State.Shared[$k]
         if ($v -is [System.Data.SqlClient.SqlCommand]) { try { $v.Cancel() } catch { } }
     }
@@ -1368,7 +1379,7 @@ function Export-CurrentResult {
     if (-not $State.ResultMap -or $State.ResultMap.Count -eq 0) { Show-Warn 'No results to export.'; return }
     $entry = $null
     foreach ($e in $State.ResultMap.Values) { if ($e.Tab -eq $tabResults.SelectedTab) { $entry = $e } }
-    if (-not $entry) { $entry = @($State.ResultMap.Values)[0] }
+    if (-not $entry) { $entry = (ConvertTo-PlainArray $State.ResultMap.Values)[0] }
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Filter = 'CSV (*.csv)|*.csv'
     $dlg.FileName = 'results_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
