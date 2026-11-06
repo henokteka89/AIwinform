@@ -29,6 +29,20 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+
+# Any error anywhere in the script (including startup) is reported with its exact line and logged.
+trap {
+    $msg = "{0}`r`n`r`n{1}`r`n`r`n{2}" -f $_, $_.InvocationInfo.PositionMessage, $_.ScriptStackTrace
+    try {
+        $logDir = Join-Path $env:APPDATA 'SqlFleetStudio'
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+        Add-Content -Path (Join-Path $logDir 'error.log') -Value ("==== {0}  script error  PS {1}`r`n{2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $PSVersionTable.PSVersion, $msg)
+    } catch { }
+    Write-Host $msg -ForegroundColor Red
+    try { [void][System.Windows.Forms.MessageBox]::Show("SQL Fleet Studio hit an error:`r`n`r`n$msg", 'SQL Fleet Studio') } catch { }
+    break
+}
+
 $AppName    = 'SQL Fleet Studio'
 $AppVersion = '1.0'
 
