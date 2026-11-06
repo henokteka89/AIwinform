@@ -49,6 +49,8 @@ if (-not ('System.Data.SqlClient.SqlConnection' -as [type])) {
     return
 }
 [System.Windows.Forms.Application]::EnableVisualStyles()
+# Anything that escapes an event handler is logged and reported instead of closing the app.
+try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch { }
 
 # ------------------------------------------------------------------ storage
 $DataDir = Join-Path $env:APPDATA 'SqlFleetStudio'
@@ -59,6 +61,7 @@ $Paths = @{
     Library  = Join-Path $DataDir 'library.json'
     Draft    = Join-Path $DataDir 'draft.sql'
     Log      = Join-Path $DataDir 'execution.log'
+    ErrorLog = Join-Path $DataDir 'error.log'
 }
 
 $DefaultServerQuery = @'
@@ -297,7 +300,7 @@ $WorkerScript = {
                 if ($stop) { try { $cmd.Cancel() } catch { } }
                 try { $reader.Close() } catch { }
                 try { if ($reader.RecordsAffected -gt 0) { $res.RowsAffected += $reader.RecordsAffected } } catch { }
-                [void]$Shared.TryRemove("cmd:$Server", [ref]$tmp)
+                $Shared["cmd:$Server"] = $null
             }
         }
         if ($res.Truncated) { [void]$msgs.Add(('Stopped at {0} rows (Max rows). Remaining rows/results were cancelled.' -f $MaxRows)) }
@@ -359,11 +362,27 @@ function Ask-YesNo([string]$m) {
     [System.Windows.Forms.MessageBox]::Show($form, $m, $AppName, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question) -eq [System.Windows.Forms.DialogResult]::Yes
 }
 
-function Invoke-Safe([scriptblock]$Action) {
+function Write-ErrorLog($Err, [string]$Where = '') {
+    try {
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add(('==== {0}  {1}  PS {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Where, $PSVersionTable.PSVersion))
+        if ($Err -is [System.Management.Automation.ErrorRecord]) {
+            $lines.Add([string]$Err)
+            if ($Err.InvocationInfo) { $lines.Add([string]$Err.InvocationInfo.PositionMessage) }
+            if ($Err.ScriptStackTrace) { $lines.Add('Script stack:'); $lines.Add([string]$Err.ScriptStackTrace) }
+            $ex = $Err.Exception
+        } else { $ex = $Err }
+        while ($ex) { $lines.Add(('{0}: {1}' -f $ex.GetType().FullName, $ex.Message)); if ($ex.StackTrace) { $lines.Add([string]$ex.StackTrace) }; $ex = $ex.InnerException }
+        Add-Content -Path $Paths.ErrorLog -Value $lines -Encoding UTF8
+    } catch { }
+}
+
+function Invoke-Safe([scriptblock]$Action, [string]$Where = 'handler') {
     try { & $Action }
     catch {
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        Show-Err (Get-InnerMessage $_)
+        Write-ErrorLog $_ $Where
+        try { $form.Cursor = [System.Windows.Forms.Cursors]::Default } catch { }
+        try { Show-Err ((Get-InnerMessage $_) + "`r`n`r`n(Details written to $($Paths.ErrorLog))") } catch { }
     }
 }
 
@@ -614,7 +633,9 @@ function New-CodeBox {
     $t.MaxLength = 0; $t.Font = $FontEditor; $t.Dock = 'Fill'
     $t.add_KeyDown({
         param($s, $e)
-        if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::A) { $s.SelectAll(); $e.SuppressKeyPress = $true }
+        Invoke-Safe {
+            if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::A) { $s.SelectAll(); $e.SuppressKeyPress = $true }
+        } 'editor KeyDown'
     })
     $t
 }
@@ -1071,17 +1092,21 @@ function New-ResultGrid {
         $p = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
         $p.SetValue($g, $true, $null)
     } catch { }
-    $g.add_DataError({ param($s, $e) $e.ThrowException = $false })
+    $g.add_DataError({ param($s, $e) try { $e.ThrowException = $false } catch { } })
     $g.add_DataBindingComplete({
         param($s, $e)
-        foreach ($c in $s.Columns) {
-            if ($c.ValueType -eq [datetime]) { $c.DefaultCellStyle.Format = 'yyyy-MM-dd HH:mm:ss.fff' }
-            if ($c.Index -eq 0) { $c.DefaultCellStyle.ForeColor = [System.Drawing.Color]::SteelBlue }
-        }
+        Invoke-Safe {
+            foreach ($c in $s.Columns) {
+                if ($c.ValueType -eq [datetime]) { $c.DefaultCellStyle.Format = 'yyyy-MM-dd HH:mm:ss.fff' }
+                if ($c.Index -eq 0) { $c.DefaultCellStyle.ForeColor = [System.Drawing.Color]::SteelBlue }
+            }
+        } 'grid DataBindingComplete'
     })
     $g.add_VisibleChanged({
         param($s, $e)
-        if ($s.Visible -and -not $s.Tag -and -not $State.Running) { Resize-GridColumns $s }
+        Invoke-Safe {
+            if ($s.Visible -and (-not $s.Tag) -and (-not $State.Running)) { Resize-GridColumns $s }
+        } 'grid VisibleChanged'
     })
     $g
 }
@@ -1280,8 +1305,9 @@ function Update-Jobs {
             Complete-Job $job $res
         } else {
             $pending++
-            $st = $null
-            if ($State.Shared.TryGetValue("state:$($job.Server)", [ref]$st)) {
+            $key = "state:$($job.Server)"
+            if ($State.Shared.ContainsKey($key)) {
+                $st = [string]$State.Shared[$key]
                 $it = $State.StatusItems[$job.Server]
                 if ($it -and $it.SubItems[1].Text -ne $st) { $it.SubItems[1].Text = $st }
             }
@@ -1317,8 +1343,9 @@ function Complete-Execution {
 function Stop-Execution {
     if (-not $State.Running) { return }
     $State.Shared['__cancel'] = $true
-    foreach ($kv in $State.Shared.ToArray()) {
-        if ($kv.Value -is [System.Data.SqlClient.SqlCommand]) { try { $kv.Value.Cancel() } catch { } }
+    foreach ($k in @($State.Shared.Keys)) {
+        $v = $State.Shared[$k]
+        if ($v -is [System.Data.SqlClient.SqlCommand]) { try { $v.Cancel() } catch { } }
     }
     $lblStatus.Text = 'Cancelling...'
 }
@@ -1510,10 +1537,13 @@ $btnAddSrv.add_Click({
 })
 $lvServers.add_ItemChecked({
     param($s, $e)
-    if ($State.Rebuilding) { return }
-    $name = $e.Item.Text
-    if ($e.Item.Checked) { [void]$State.Checked.Add($name) } else { [void]$State.Checked.Remove($name) }
-    Update-ServerSummary
+    Invoke-Safe {
+        if (-not $State.Rebuilding) {
+            $name = $e.Item.Text
+            if ($e.Item.Checked) { [void]$State.Checked.Add($name) } else { [void]$State.Checked.Remove($name) }
+            Update-ServerSummary
+        }
+    } 'server ItemChecked'
 })
 $miCheckOnly.add_Click({
     Invoke-Safe {
@@ -1544,21 +1574,26 @@ $miRemove.add_Click({
 # library
 $txtLibSearch.add_TextChanged({ Invoke-Safe { Update-LibraryList $State.LibSelectedId } })
 $lvLib.add_SelectedIndexChanged({
-    if ($lvLib.SelectedItems.Count -ne 1) { return }
-    $q = Find-LibEntry ([string]$lvLib.SelectedItems[0].Tag)
-    if ($q) {
-        $State.LibSelectedId = $q.Id
-        $txtLibName.Text = [string]$q.Name
-        $cboLibCat.Text = [string]$q.Category
-        $txtLibSql.Text = ConvertTo-CrLf ([string]$q.Sql)
-    }
+    Invoke-Safe {
+        if ($lvLib.SelectedItems.Count -eq 1) {
+            $q = Find-LibEntry ([string]$lvLib.SelectedItems[0].Tag)
+            if ($q) {
+                $State.LibSelectedId = $q.Id
+                $txtLibName.Text = [string]$q.Name
+                $cboLibCat.Text = [string]$q.Category
+                $txtLibSql.Text = ConvertTo-CrLf ([string]$q.Sql)
+            }
+        }
+    } 'library SelectedIndexChanged'
 })
 $lvLib.add_DoubleClick({ Invoke-Safe { Send-ToEditor $txtLibSql.Text } })
 $btnLibNew.add_Click({
-    $State.LibSelectedId = $null
-    $lvLib.SelectedItems.Clear()
-    $txtLibName.Text = ''; $txtLibSql.Text = ''
-    $txtLibName.Focus()
+    Invoke-Safe {
+        $State.LibSelectedId = $null
+        $lvLib.SelectedItems.Clear()
+        $txtLibName.Text = ''; $txtLibSql.Text = ''
+        [void]$txtLibName.Focus()
+    } 'library New'
 })
 $btnLibSave.add_Click({
     Invoke-Safe {
@@ -1613,22 +1648,28 @@ $btnSetTest.add_Click({
         Show-Info ("Connected.`r`n`r`nServer: {0}`r`nDatabase: {1}`r`nLogin: {2}" -f $r[0], $r[1], $r[2])
     }
 })
-$btnSetFolder.add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $DataDir) })
-$btnSetForget.add_Click({ $State.SqlCredential = $null; $lblStatus.Text = 'SQL credential cleared from memory.' })
+$btnSetFolder.add_Click({ Invoke-Safe { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $DataDir) } 'open folder' })
+$btnSetForget.add_Click({ Invoke-Safe { $State.SqlCredential = $null; $lblStatus.Text = 'SQL credential cleared from memory.' } 'forget credential' })
 
 # form-level keys and lifecycle
 $form.add_KeyDown({
     param($s, $e)
-    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F5 -or ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::E)) {
-        $e.SuppressKeyPress = $true; $e.Handled = $true
-        if ($tabsMain.SelectedTab -eq $tabExec) { Invoke-Safe { Start-Execution } }
-    } elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and $State.Running) {
-        $e.Handled = $true
-        Stop-Execution
-    }
+    Invoke-Safe {
+        $key = $e.KeyCode
+        $isRun = ($key -eq [System.Windows.Forms.Keys]::F5)
+        if ($e.Control -and $key -eq [System.Windows.Forms.Keys]::E) { $isRun = $true }
+        if ($isRun) {
+            $e.SuppressKeyPress = $true
+            $e.Handled = $true
+            if ($tabsMain.SelectedTab -eq $tabExec) { Start-Execution }
+        } elseif ($key -eq [System.Windows.Forms.Keys]::Escape) {
+            if ($State.Running) { $e.Handled = $true; Stop-Execution }
+        }
+    } 'form KeyDown'
 })
 
 $form.add_Shown({
+  Invoke-Safe {
     try {
         $splitMain.SplitterDistance = 360
         $splitExec.SplitterDistance = [int]($splitExec.Height * 0.42)
@@ -1636,18 +1677,28 @@ $form.add_Shown({
     } catch { }
     $State.Rebuilding = $false   # ListView raises ItemChecked while creating its handle; ignore those
     Update-ServerSummary
-    $txtEditor.Focus()
+    [void]$txtEditor.Focus()
+  } 'form Shown'
 })
 
 $form.add_FormClosing({
     param($s, $e)
-    if ($State.Running) {
-        if (-not (Ask-YesNo 'A query is still running. Cancel it and exit?')) { $e.Cancel = $true; return }
-        Stop-Execution
-        foreach ($j in $State.Jobs) { if (-not $j.Done) { try { [void]$j.PS.BeginStop($null, $null) } catch { } } }
-    }
-    try { Save-ServerCache } catch { }
-    try { Set-Content -Path $Paths.Draft -Value $txtEditor.Text -Encoding UTF8 } catch { }
+    Invoke-Safe {
+        $closeIt = $true
+        if ($State.Running) {
+            if (Ask-YesNo 'A query is still running. Cancel it and exit?') {
+                Stop-Execution
+                foreach ($j in $State.Jobs) { if (-not $j.Done) { try { [void]$j.PS.BeginStop($null, $null) } catch { } } }
+            } else {
+                $e.Cancel = $true
+                $closeIt = $false
+            }
+        }
+        if ($closeIt) {
+            try { Save-ServerCache } catch { }
+            try { Set-Content -Path $Paths.Draft -Value $txtEditor.Text -Encoding UTF8 } catch { }
+        }
+    } 'form Closing'
 })
 
 # ------------------------------------------------------------------ startup
@@ -1672,6 +1723,18 @@ if (-not $State.Settings.CentralServer) {
     $lblStatus.Text = "Loaded $($State.Servers.Count) cached servers ($($State.Source), $($State.RefreshedAt)). Click Refresh to update."
 }
 
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($s, $e)
+    Write-ErrorLog $e.Exception 'unhandled UI exception'
+    try { Show-Err ($e.Exception.Message + "`r`n`r`nThe app is still running. Details written to $($Paths.ErrorLog)") } catch { }
+})
+
 $State.Rebuilding = $true
-[void]$form.ShowDialog()
-$form.Dispose()
+try {
+    [void]$form.ShowDialog()
+} catch {
+    Write-ErrorLog $_ 'ShowDialog'
+    [void][System.Windows.Forms.MessageBox]::Show(("SQL Fleet Studio stopped: " + (Get-InnerMessage $_) + "`r`n`r`nDetails: $($Paths.ErrorLog)"), $AppName)
+} finally {
+    $form.Dispose()
+}

@@ -37,7 +37,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\SqlFleetStudio.ps
 - **Audit log:** every run (who, when, servers, database, mode, full query, outcome) is appended to `%APPDATA%\SqlFleetStudio\execution.log`.
 
 ## Data
-Everything lives in `%APPDATA%\SqlFleetStudio`: `settings.json`, `servers.json` (cache and checked servers), `library.json` (copy it to share queries), `draft.sql` (editor contents) and `execution.log`.
+Everything lives in `%APPDATA%\SqlFleetStudio`: `settings.json`, `servers.json` (cache and checked servers), `library.json` (copy it to share queries), `draft.sql` (editor contents), `execution.log` and `error.log` (full details of any error, including the script line).
 
 ## Requirements
 - Windows PowerShell 5.1 (uses `System.Data.SqlClient`).
