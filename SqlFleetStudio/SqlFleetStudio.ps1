@@ -570,16 +570,18 @@ function Find-LibEntry([string]$Id) {
 function New-SqlConnectionString([string]$Server, [string]$Database, [switch]$NoIntent) {
     $S = $State.Settings
     $b = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-    $b.DataSource = $Server
-    $b.InitialCatalog = $Database
-    $b.ApplicationName = 'SqlFleetStudio'
-    $b.ConnectTimeout = [int]$S.ConnectTimeout
-    $b.Encrypt = [bool]$S.Encrypt
-    $b.TrustServerCertificate = [bool]$S.TrustServerCertificate
-    $b.MultiSubnetFailover = [bool]$S.MultiSubnetFailover
-    if ($S.AuthMode -ne 'SQL') { $b.IntegratedSecurity = $true }
-    if ($S.ReadOnlyIntent -and -not $NoIntent) { $b.ApplicationIntent = [System.Data.SqlClient.ApplicationIntent]::ReadOnly }
-    $b.ConnectionString
+    # PowerShell treats the builder as a dictionary, so $b.DataSource would be taken as a keyword
+    # named "DataSource". Set the real connection-string keywords through the indexer instead.
+    $b['Data Source'] = $Server
+    $b['Initial Catalog'] = $Database
+    $b['Application Name'] = 'SqlFleetStudio'
+    $b['Connect Timeout'] = [int]$S.ConnectTimeout
+    $b['Encrypt'] = [bool]$S.Encrypt
+    $b['TrustServerCertificate'] = [bool]$S.TrustServerCertificate
+    $b['MultiSubnetFailover'] = [bool]$S.MultiSubnetFailover
+    if ($S.AuthMode -ne 'SQL') { $b['Integrated Security'] = $true }
+    if ($S.ReadOnlyIntent -and -not $NoIntent) { $b['ApplicationIntent'] = 'ReadOnly' }
+    $b.ToString()
 }
 
 function Get-SqlCred {
