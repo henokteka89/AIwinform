@@ -11,9 +11,16 @@
       Nothing is changed.
 
     EXECUTE (only when "Execute" is selected AND you type the destination server name to confirm)
+      DIRECT METHOD (default, SQL Server 2012+): no folders, files or shares.
+      Source      : SELECT CERTENCODED / CERTPRIVATEKEY (read-only; key encrypted by your password, kept in memory)
+      Destination : CREATE MASTER KEY (only if master has none AND you ticked it),
+                    CREATE CERTIFICATE ... FROM BINARY ... WITH PRIVATE KEY (BINARY ..., DECRYPTION BY PASSWORD)
+      FILE METHOD (option):
       Source      : EXEC xp_create_subdir (export folder), BACKUP CERTIFICATE ... WITH PRIVATE KEY
                     (ENCRYPTION BY PASSWORD) to NEW, time-stamped files.
-      This PC     : copies the .cer/.pvk files to the destination folder, verifies SHA-256, never overwrites.
+      This PC     : creates a hidden, temporary SMB share on the export folder (source host) and on the import
+                    folder (destination host), copies the .cer/.pvk files, verifies SHA-256, never overwrites, and
+                    removes the shares again when done (also after a failure). Folders and files are kept.
       Destination : EXEC xp_create_subdir (import folder), CREATE MASTER KEY (only if master has none AND you
                     ticked it), CREATE CERTIFICATE ... FROM FILE ... WITH PRIVATE KEY (DECRYPTION BY PASSWORD).
 
@@ -49,6 +56,9 @@ $script:State = [pscustomobject]@{ Src = $null; Dst = $null; SrcConn = $null; Ds
 $script:Plan = $null
 $script:Running = $false
 $script:SqlMessages = New-Object System.Collections.Generic.List[string]
+$script:CreatedShares = @{}   # shares this run created: key HOST|NAME -> spec. Only these are ever removed.
+$script:CimSessions = @{}
+$script:Blobs = @{}           # thumbprint -> @{ Cer = byte[]; Pvk = byte[] }, held in memory only during a run
 
 $script:LogDir = Join-Path $env:LOCALAPPDATA 'TdeCertMigration'
 try { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null } catch { $script:LogDir = $env:TEMP }
@@ -95,6 +105,11 @@ function Get-SqlErrorText {
 }
 
 function Get-Me { return "$env:USERDOMAIN\$env:USERNAME" }
+
+function ConvertTo-HexLiteral {
+    param([byte[]]$Bytes)
+    return '0x' + [System.BitConverter]::ToString($Bytes).Replace('-', '')
+}
 
 #endregion
 
@@ -209,7 +224,7 @@ ORDER BY CASE WHEN EXISTS (SELECT 1 FROM sys.dm_database_encryption_keys AS k
 
 function Add-Step {
     param($Plan, [string]$Where, [string]$Title, [string]$What, [string]$Kind = 'Sql', [string]$Sql = '',
-          [string]$Status = 'Planned', [hashtable]$Data = @{}, [switch]$Changes)
+          [string]$Status = 'Planned', [hashtable]$Data = @{}, [switch]$Changes, [switch]$AlwaysRun)
     switch ($Where) {
         'SOURCE'      { $server = $Plan.Src.ServerName }
         'DESTINATION' { $server = $Plan.Dst.ServerName }
@@ -217,7 +232,7 @@ function Add-Step {
     }
     $s = [pscustomobject]@{
         No = $Plan.Steps.Count + 1; Where = $Where; Server = $server; Title = $Title; What = $What
-        Kind = $Kind; Sql = $Sql; Status = $Status; Data = $Data; Changes = [bool]$Changes; Result = ''
+        Kind = $Kind; Sql = $Sql; Status = $Status; Data = $Data; Changes = [bool]$Changes; AlwaysRun = [bool]$AlwaysRun; Result = ''
     }
     [void]$Plan.Steps.Add($s)
 }
@@ -232,9 +247,23 @@ function Get-Guard {
 function Get-StepCode {
     param($Step, [switch]$Mask)
     switch ($Step.Kind) {
-        'Sql' {
-            if ($Mask) { return $Step.Sql.Replace($script:TokCert, "N'<<CERT_PASSWORD>>'").Replace($script:TokDmk, "N'<<DMK_PASSWORD>>'") }
-            return $Step.Sql.Replace($script:TokCert, (QS $txtCertPwd.Text)).Replace($script:TokDmk, (QS $txtDmkPwd.Text))
+        { $_ -in 'Sql', 'Fetch' } {
+            if ($Mask) {
+                $t = [regex]::Replace($Step.Sql, '<<#(CER|PVK):(0x[0-9A-Fa-f]+)#>>', {
+                    param($m)
+                    if ($m.Groups[1].Value -eq 'CER') { return '<<CERTIFICATE_BYTES_FROM_SOURCE>>' }
+                    return '<<ENCRYPTED_PRIVATE_KEY_BYTES_FROM_SOURCE>>'
+                })
+                return $t.Replace($script:TokCert, "N'<<CERT_PASSWORD>>'").Replace($script:TokDmk, "N'<<DMK_PASSWORD>>'")
+            }
+            $t = [regex]::Replace($Step.Sql, '<<#(CER|PVK):(0x[0-9A-Fa-f]+)#>>', {
+                param($m)
+                $b = $script:Blobs[$m.Groups[2].Value]
+                if (-not $b) { throw "The bytes of certificate $($m.Groups[2].Value) were not read from the source in this run." }
+                if ($m.Groups[1].Value -eq 'CER') { return (ConvertTo-HexLiteral $b.Cer) }
+                return (ConvertTo-HexLiteral $b.Pvk)
+            })
+            return $t.Replace($script:TokCert, (QS $txtCertPwd.Text)).Replace($script:TokDmk, (QS $txtDmkPwd.Text))
         }
         'Copy' {
             $sb = New-Object System.Text.StringBuilder
@@ -254,8 +283,40 @@ function Get-StepCode {
             foreach ($f in $Step.Data.Files) { [void]$sb.AppendLine("Remove-Item -LiteralPath '$(Join-WinPath $Step.Data.Dir $f)'") }
             return $sb.ToString().TrimEnd()
         }
+        'ShareCreate' {
+            $d = $Step.Data
+            $acc = '-ChangeAccess'
+            if ($d.Access -eq 'Read') { $acc = '-ReadAccess' }
+            $lines = @(
+                "# PowerShell, run by the tool on this PC ($env:COMPUTERNAME) as $(Get-Me), against $($d.Host) (WinRM, DCOM if WinRM fails)"
+                '# Adds a NEW hidden, temporary share on the existing folder (gone after a reboot anyway). Stops if the name is taken.'
+                ('$cim = New-CimSession -ComputerName ''{0}''' -f $d.Host)
+                ('New-SmbShare -CimSession $cim -Name ''{0}'' -Path ''{1}'' {2} ''{3}'' -Temporary -CachingMode None' -f $d.Name, $d.Path, $acc, $d.Account)
+                ('# this PC then uses \\{0}\{1}' -f $d.Host, $d.Name)
+            )
+            return ($lines -join "`r`n")
+        }
+        'ShareRemove' {
+            $lines = New-Object System.Collections.Generic.List[string]
+            $lines.Add("# PowerShell, run by the tool on this PC ($env:COMPUTERNAME) as $(Get-Me). Runs even if an earlier step failed.")
+            $lines.Add('# Removes ONLY the share this run created (and only if it still points at the same folder). The folder and files are kept.')
+            foreach ($d in $Step.Data.Specs) {
+                $lines.Add(('Remove-SmbShare -CimSession (New-CimSession -ComputerName ''{0}'') -Name ''{1}'' -Force   # folder {2} is kept' -f $d.Host, $d.Name, $d.Path))
+            }
+            return ($lines -join "`r`n")
+        }
         default { return '-- (no action: information only)' }
     }
+}
+
+# Temporary share for a folder on a SQL Server host. Returns $null when no share is needed
+# (the path is already UNC, or the host is this PC).
+function New-ShareSpec {
+    param([string]$HostName, [string]$Path, [string]$Name, [string]$Access)
+    if ($Path -match '^\\') { return $null }
+    if ($Path -notmatch '^[A-Za-z]:\') { throw "Folder '$Path' must be a local drive path (D:\...) or a UNC path." }
+    if ($HostName -ieq $env:COMPUTERNAME) { return $null }
+    return @{ Host = $HostName; Path = $Path; Name = $Name; Access = $Access; Account = (Get-Me) }
 }
 
 function New-Plan {
@@ -277,15 +338,30 @@ function New-Plan {
     $sel = @($script:State.SrcCerts.Rows | Where-Object { $_.Migrate -eq $true })
     if (-not $sel.Count) { throw 'Tick at least one certificate on the Source tab.' }
 
-    $srcSql = $txtSrcFolder.Text.Trim().TrimEnd('\'); $srcUnc = $txtSrcUnc.Text.Trim().TrimEnd('\')
-    $dstSql = $txtDstFolder.Text.Trim().TrimEnd('\'); $dstUnc = $txtDstUnc.Text.Trim().TrimEnd('\')
-    foreach ($p in @($srcSql, $srcUnc, $dstSql, $dstUnc)) { if (-not $p) { throw 'Fill in all four folder paths on the Transfer tab.' } }
-
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $method = $cboMethod.SelectedIndex   # 0 direct (binary through the SQL connections), 1 files
+    if ($method -eq 0 -and ($src.Major -lt 11 -or $dst.Major -lt 11)) {
+        throw "The direct method needs SQL Server 2012 or later on both servers (source is $($src.Major), destination is $($dst.Major)). Choose the file method on the Transfer tab."
+    }
+    $reach = $cboReach.SelectedIndex   # 0 temporary shares, 1 admin shares, 2 typed paths
+    $srcSql = $txtSrcFolder.Text.Trim().TrimEnd('\'); $dstSql = $txtDstFolder.Text.Trim().TrimEnd('\')
+    $srcShare = $null; $dstShare = $null; $srcUnc = ''; $dstUnc = ''
+    if ($method -eq 1 -and (-not $srcSql -or -not $dstSql)) { throw 'Fill in the export and import folders on the Transfer tab.' }
+    if ($method -eq 0) { }
+    elseif ($reach -eq 0) {
+        $srcShare = New-ShareSpec $src.HostName $srcSql "TDEMIG_SRC_$stamp`$" 'Read'
+        $dstShare = New-ShareSpec $dst.HostName $dstSql "TDEMIG_DST_$stamp`$" 'Change'
+        $srcUnc = Get-UncPath $srcSql $src.HostName; $dstUnc = Get-UncPath $dstSql $dst.HostName
+        if ($srcShare) { $srcUnc = "\\$($srcShare.Host)\$($srcShare.Name)" }
+        if ($dstShare) { $dstUnc = "\\$($dstShare.Host)\$($dstShare.Name)" }
+    } else {
+        $srcUnc = $txtSrcUnc.Text.Trim().TrimEnd('\'); $dstUnc = $txtDstUnc.Text.Trim().TrimEnd('\')
+        if (-not $srcUnc -or -not $dstUnc) { throw "Fill in both 'as THIS PC reaches it' paths on the Transfer tab." }
+    }
     $plan = [pscustomobject]@{
         Steps = New-Object System.Collections.ArrayList; Warnings = New-Object System.Collections.Generic.List[string]
         Certs = @(); Stamp = $stamp; Src = $src; Dst = $dst; Created = Get-Date
-        SrcSql = $srcSql; SrcUnc = $srcUnc; DstSql = $dstSql; DstUnc = $dstUnc
+        SrcSql = $srcSql; SrcUnc = ''; DstSql = $dstSql; DstUnc = ''; Reach = $reach; Method = $method
         NeedsCertPwd = $false; NeedsDmkPwd = $false; Blocked = $false
     }
     $suffix = ($cboConflict.SelectedIndex -eq 1)
@@ -315,13 +391,14 @@ function New-Plan {
         $c
     }
     $plan.Certs = @($certs)
+    $plan.SrcUnc = $srcUnc; $plan.DstUnc = $dstUnc
     $move = @($plan.Certs | Where-Object { $_.State -eq 'Move' })
 
     # warnings (do not block)
     if ($dst.Major -lt $src.Major) { $plan.Warnings.Add("Destination is SQL Server major version $($dst.Major), source is $($src.Major). Certificates backed up on a newer version may not restore on an older one: test first.") }
     foreach ($x in @(@{ S = $src; R = 'source' }, @{ S = $dst; R = 'destination' })) {
         if (-not $x.S.IsSysadmin -and -not $x.S.HasControl) { $plan.Warnings.Add("Your login is not sysadmin / CONTROL SERVER on the $($x.R) $($x.S.ServerName); BACKUP / CREATE CERTIFICATE and xp_create_subdir will probably fail.") }
-        elseif (-not $x.S.IsSysadmin) { $plan.Warnings.Add("Your login is not sysadmin on the $($x.R) $($x.S.ServerName); xp_create_subdir needs sysadmin. Create the folder by hand if that step fails.") }
+        elseif (-not $x.S.IsSysadmin -and $method -eq 1) { $plan.Warnings.Add("Your login is not sysadmin on the $($x.R) $($x.S.ServerName); xp_create_subdir needs sysadmin. Create the folder by hand if that step fails.") }
     }
     foreach ($c in $plan.Certs) {
         $row = @($script:State.SrcCerts.Rows | Where-Object { [string]$_.Thumbprint -eq $c.Thumb })[0]
@@ -329,8 +406,16 @@ function New-Plan {
             $plan.Warnings.Add("Certificate [$($c.Name)] expired on $($row.ExpiryDate). TDE still works with an expired certificate, but plan a rotation.")
         }
     }
-    $sameFolder = ($srcUnc -ieq $dstUnc)
-    if ($move.Count -and -not $sameFolder) {
+    $sameFolder = ($method -eq 1 -and $srcSql -ieq $dstSql -and ($src.HostName -ieq $dst.HostName -or $srcSql -match '^\\\\'))
+    if ($method -eq 1 -and $reach -ne 0 -and $srcUnc -ieq $dstUnc) { $sameFolder = $true }
+    if ($sameFolder) { $srcShare = $null; $dstShare = $null }
+    if ($method -eq 1 -and $move.Count -and -not $sameFolder -and $reach -eq 0) {
+        foreach ($sh in @($srcShare, $dstShare) | Where-Object { $_ }) {
+            try { Test-WSMan -ComputerName $sh.Host -ErrorAction Stop | Out-Null }
+            catch { $plan.Warnings.Add("WinRM to $($sh.Host) did not answer; the share step will try DCOM. If both fail, choose 'Admin share' or 'Paths I type' on the Transfer tab.") }
+        }
+    }
+    if ($method -eq 1 -and $move.Count -and -not $sameFolder -and $reach -ne 0) {
         foreach ($u in @($srcUnc, $dstUnc)) {
             if ($u -match '^(\\\\[^\\]+\\[^\\]+)') {
                 $root = $Matches[1]
@@ -400,6 +485,17 @@ function New-Plan {
         $files = New-Object System.Collections.Generic.List[string]
         foreach ($c in $move) { $files.Add("$($c.File).cer"); $files.Add("$($c.File).pvk") }
 
+        if ($method -eq 0) {
+        # 3. read certificate + encrypted private key on the source (read-only, no files)
+        foreach ($c in $move) {
+            $id = "CERT_ID($(QS $c.Name))"
+            $q = $sg +
+                "SELECT CERTENCODED($id) AS cer,`r`n       CERTPRIVATEKEY($id, $script:TokCert) AS pvk`r`nFROM master.sys.certificates WHERE name = $(QS $c.Name) AND thumbprint = $($c.Thumb);"
+            Add-Step $plan 'SOURCE' "Read certificate [$($c.Name)] and its encrypted private key (read-only)" `
+                "Read-only, no files. CERTENCODED returns the public certificate and CERTPRIVATEKEY returns the private key ENCRYPTED with your certificate password. Both are held only in this program's memory, are never written to disk or the log, and are cleared when the run ends. This PC then checks that the SHA-1 of the certificate bytes equals the thumbprint $($c.Thumb)." `
+                -Kind 'Fetch' -Sql $q -Data @{ Thumb = $c.Thumb; Name = $c.Name }
+        }
+        } else {
         # 3. export folder on the source
         Add-Step $plan 'SOURCE' 'Create the export folder (if missing)' `
             "Creates $srcSql on $($src.HostName) if it does not exist (xp_create_subdir does nothing when it already exists). The folder is created by the SQL Server service account, so it can write the files there. Nothing else is touched." `
@@ -418,14 +514,32 @@ function New-Plan {
             Add-Step $plan 'DESTINATION' 'Create the import folder (if missing)' `
                 "Creates $dstSql on $($dst.HostName) if it does not exist. The folder is created by the destination SQL Server service account, so it can read the files. Nothing else is touched." `
                 -Sql ($dg + "EXEC master.dbo.xp_create_subdir $(QS $dstSql);`r`nPRINT N'Import folder ready: $($dstSql.Replace("'", "''"))';") -Changes
+            if ($srcShare) {
+                Add-Step $plan 'SOURCE' "Create temporary share $($srcShare.Name) on $($srcShare.Host)" `
+                    "Shares the existing export folder $srcSql on $($srcShare.Host) as \\$($srcShare.Host)\$($srcShare.Name): hidden (`$), temporary (also gone after a reboot), READ access for $($srcShare.Account) only. Run from this PC over WinRM (DCOM if WinRM fails). The folder and other shares are not touched. Removed again right after the copy." `
+                    -Kind 'ShareCreate' -Data $srcShare -Changes
+            }
+            if ($dstShare) {
+                Add-Step $plan 'DESTINATION' "Create temporary share $($dstShare.Name) on $($dstShare.Host)" `
+                    "Shares the existing import folder $dstSql on $($dstShare.Host) as \\$($dstShare.Host)\$($dstShare.Name): hidden (`$), temporary (also gone after a reboot), CHANGE access for $($dstShare.Account) only. The folder and other shares are not touched. Removed again when it is no longer needed." `
+                    -Kind 'ShareCreate' -Data $dstShare -Changes
+            }
             Add-Step $plan 'THIS PC' "Copy $($files.Count) file(s) to the destination and verify SHA-256" `
                 "This PC copies the .cer and .pvk files from $srcUnc to $dstUnc, then compares the SHA-256 hash of every copy with the original. It never overwrites: it stops if a file with the same name is already there." `
                 -Kind 'Copy' -Data @{ SrcDir = $srcUnc; DstDir = $dstUnc; Files = @($files) } -Changes
+            $keepDst = ($dstShare -and $chkDeleteDest.Checked)   # the delete step needs the destination share
+            $now = @(@($srcShare, $dstShare) | Where-Object { $_ -and -not ($keepDst -and $_ -eq $dstShare) })
+            if ($now.Count) {
+                Add-Step $plan 'THIS PC' "Remove the temporary share(s): $(($now | ForEach-Object { $_.Name }) -join ', ')" `
+                    "Removes only the share(s) this run created, and only if they still point at the same folder. The folders and the certificate files stay where they are. This step runs even if an earlier step failed." `
+                    -Kind 'ShareRemove' -Data @{ Specs = $now } -Changes -AlwaysRun
+            }
         } else {
             Add-Step $plan 'THIS PC' 'No copy needed' "The source export folder and the destination import folder are the same folder ($srcUnc), so nothing is copied." -Kind 'Info' -Status 'Skip'
         }
+        }   # end file method
 
-        # 6. master key (only now, after export and copy succeeded)
+        # 6. master key (only now, after the read / export and copy succeeded)
         if ($createDmk) {
             Add-Step $plan 'DESTINATION' 'Create the database master key in master' `
                 "Creates the database master key in master on $($dst.ServerName) (only if there still is none). It protects the certificate private key; SQL Server also encrypts it by the service master key so it opens automatically. BACK IT UP afterwards (BACKUP MASTER KEY) and keep the password in your vault." `
@@ -441,12 +555,20 @@ function New-Plan {
                 "IF EXISTS (SELECT 1 FROM master.sys.certificates WHERE thumbprint = $($c.Thumb))`r`n    BEGIN PRINT $(QS $msgExists); RETURN; END;`r`n" +
                 "IF EXISTS (SELECT 1 FROM master.sys.certificates WHERE name = $(QS $c.DestName))`r`n    BEGIN RAISERROR($(QS $msgName), 16, 1, $(QS $c.DestName)); RETURN; END;`r`n" +
                 $openDmk +
-                "CREATE CERTIFICATE $(QN $c.DestName)`r`n    FROM FILE = $(QS $cer)`r`n    WITH PRIVATE KEY (FILE = $(QS $pvk),`r`n                      DECRYPTION BY PASSWORD = $script:TokCert);`r`n" +
+                $(if ($method -eq 0) {
+                    "CREATE CERTIFICATE $(QN $c.DestName)`r`n    FROM BINARY = <<#CER:$($c.Thumb)#>>`r`n    WITH PRIVATE KEY (BINARY = <<#PVK:$($c.Thumb)#>>,`r`n                      DECRYPTION BY PASSWORD = $script:TokCert);`r`n"
+                } else {
+                    "CREATE CERTIFICATE $(QN $c.DestName)`r`n    FROM FILE = $(QS $cer)`r`n    WITH PRIVATE KEY (FILE = $(QS $pvk),`r`n                      DECRYPTION BY PASSWORD = $script:TokCert);`r`n"
+                }) +
                 $closeDmk +
                 "PRINT N'Created certificate $($c.DestName.Replace("'", "''")).';"
-            $what = "Creates certificate [$($c.DestName)] in master on $($dst.ServerName) from the copied files, decrypting the private key with your certificate password and protecting it with the destination master key. Skipped if the same certificate is already there; stops (changes nothing) if another certificate has that name."
+            $from = 'the copied files'
+            if ($method -eq 0) { $from = 'the bytes read from the source (FROM BINARY, no files)' }
+            $what = "Creates certificate [$($c.DestName)] in master on $($dst.ServerName) from $from, decrypting the private key with your certificate password and protecting it with the destination master key. Skipped if the same certificate is already there; stops (changes nothing) if another certificate has that name."
             if ($c.Note) { $what += " Note: $($c.Note)." }
-            Add-Step $plan 'DESTINATION' "Create certificate [$($c.DestName)] from the files" $what -Sql $q -Changes
+            $t = 'from the files'
+            if ($method -eq 0) { $t = 'from the source bytes' }
+            Add-Step $plan 'DESTINATION' "Create certificate [$($c.DestName)] $t" $what -Sql $q -Changes
         }
 
         # 8. verify (read-only)
@@ -464,14 +586,19 @@ function New-Plan {
             -Sql $sb.ToString()
 
         # 9. optional clean-up of the copies
-        if ($chkDeleteDest.Checked) {
+        if ($method -eq 1 -and $chkDeleteDest.Checked) {
             if ($sameFolder) {
                 Add-Step $plan 'THIS PC' 'Delete copies: skipped' 'The import folder is the same as the export folder; the files are kept (they are the only backup).' -Kind 'Info' -Status 'Skip'
             } else {
                 Add-Step $plan 'THIS PC' "Delete the $($files.Count) copied file(s) from the destination folder" `
-                    "Deletes only the files this run copied to $dstUnc, and only after the verification step passed. The export on the source ($srcUnc) is kept: move it to a safe place." `
+                    "Deletes only the files this run copied to $dstUnc, and only after the verification step passed. The export on the source ($srcSql on $($src.HostName)) is kept: move it to a safe place." `
                     -Kind 'Delete' -Data @{ Dir = $dstUnc; Files = @($files) } -Changes
             }
+        }
+        if ($method -eq 1 -and -not $sameFolder -and $dstShare -and $chkDeleteDest.Checked) {
+            Add-Step $plan 'THIS PC' "Remove the temporary share: $($dstShare.Name)" `
+                "Removes only the share this run created on $($dstShare.Host), and only if it still points at $dstSql. The folder is kept. This step runs even if an earlier step failed." `
+                -Kind 'ShareRemove' -Data @{ Specs = @($dstShare) } -Changes -AlwaysRun
         }
     } elseif (-not $plan.Blocked) {
         Add-Step $plan 'THIS PC' 'Nothing to do' 'All selected certificates are already on the destination.' -Kind 'Info' -Status 'Skip'
@@ -498,8 +625,13 @@ function Get-PlanScript {
     [void]$sb.AppendLine("  $script:AppName $script:Version - plan generated $($Plan.Created.ToString('yyyy-MM-dd HH:mm:ss')) by $(Get-Me) on $env:COMPUTERNAME")
     [void]$sb.AppendLine("  SOURCE      : $($Plan.Src.ServerName)  (host $($Plan.Src.HostName), $($Plan.Src.Version) $($Plan.Src.Level), $($Plan.Src.Edition))")
     [void]$sb.AppendLine("  DESTINATION : $($Plan.Dst.ServerName)  (host $($Plan.Dst.HostName), $($Plan.Dst.Version) $($Plan.Dst.Level), $($Plan.Dst.Edition))")
-    [void]$sb.AppendLine("  Export folder (source SQL Server)      : $($Plan.SrcSql)     from this PC: $($Plan.SrcUnc)")
-    [void]$sb.AppendLine("  Import folder (destination SQL Server) : $($Plan.DstSql)     from this PC: $($Plan.DstUnc)")
+    if ($Plan.Method -eq 1) {
+        [void]$sb.AppendLine("  Export folder (source SQL Server)      : $($Plan.SrcSql)     from this PC: $($Plan.SrcUnc)")
+        [void]$sb.AppendLine("  Import folder (destination SQL Server) : $($Plan.DstSql)     from this PC: $($Plan.DstUnc)")
+    }
+    if ($Plan.Method -eq 0) { $how = 'not needed - direct method: the certificate travels as bytes over the two SQL connections (no folders, files or shares)' }
+    else { $how = @('temporary hidden shares, created by the run and removed when done (folders kept)', 'admin shares (\\host\X$)', 'paths typed by you')[$Plan.Reach] }
+    [void]$sb.AppendLine("  This PC reaches the folders through: $how")
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('  Passwords are shown as <<CERT_PASSWORD>> / <<DMK_PASSWORD>>; they are never saved.')
     [void]$sb.AppendLine('  To run it by hand: SSMS > Query > SQLCMD Mode, replace the placeholders, run one step at a time,')
@@ -529,7 +661,12 @@ function Get-PlanScript {
             [void]$sb.AppendLine(":CONNECT $($s.Server)")
             [void]$sb.AppendLine((Get-StepCode $s -Mask).TrimEnd())
             [void]$sb.AppendLine('GO')
-        } elseif ($s.Kind -in 'Copy', 'Delete') {
+        } elseif ($s.Kind -eq 'Fetch') {
+            [void]$sb.AppendLine(":CONNECT $($s.Server)")
+            [void]$sb.AppendLine((Get-StepCode $s -Mask).TrimEnd())
+            [void]$sb.AppendLine('GO')
+            [void]$sb.AppendLine('-- Copy the two values from the result into the CREATE CERTIFICATE step below (the tool does this in memory).')
+        } elseif ($s.Kind -in 'Copy', 'Delete', 'ShareCreate', 'ShareRemove') {
             foreach ($l in ((Get-StepCode $s -Mask) -split "`r?`n")) { [void]$sb.AppendLine("-- $l") }
         }
     }
@@ -575,6 +712,93 @@ function Invoke-DeleteStep {
         $p = Join-WinPath $Step.Data.Dir $f
         if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p; Write-Log "Deleted copy $p" 'OK' }
     }
+}
+
+function Get-HostCim {
+    param([string]$HostName)
+    if ($script:CimSessions.ContainsKey($HostName)) { return $script:CimSessions[$HostName] }
+    try { $s = New-CimSession -ComputerName $HostName -OperationTimeoutSec 60 -ErrorAction Stop }
+    catch {
+        Write-Log "WinRM to $HostName failed ($($_.Exception.Message)); trying DCOM." 'WARN'
+        $s = New-CimSession -ComputerName $HostName -SessionOption (New-CimSessionOption -Protocol Dcom) -OperationTimeoutSec 60 -ErrorAction Stop
+    }
+    $script:CimSessions[$HostName] = $s
+    return $s
+}
+
+function Close-HostCims {
+    foreach ($k in @($script:CimSessions.Keys)) { try { Remove-CimSession -CimSession $script:CimSessions[$k] } catch { } }
+    $script:CimSessions = @{}
+}
+
+function Invoke-ShareCreateStep {
+    param($Step)
+    $d = $Step.Data
+    $cim = Get-HostCim $d.Host
+    if (Get-SmbShare -CimSession $cim -Name $d.Name -ErrorAction SilentlyContinue) { throw "A share named $($d.Name) already exists on $($d.Host). It was not touched." }
+    $p = @{ CimSession = $cim; Name = $d.Name; Path = $d.Path; Temporary = $true; CachingMode = 'None'; ErrorAction = 'Stop'
+            Description = "TdeCertMigration temporary share ($(Get-Me), $(Get-Date -Format 'yyyy-MM-dd HH:mm')). Safe to remove." }
+    if ($d.Access -eq 'Read') { $p.ReadAccess = $d.Account } else { $p.ChangeAccess = $d.Account }
+    New-SmbShare @p | Out-Null
+    $script:CreatedShares["$($d.Host)|$($d.Name)"] = $d
+    Write-Log "Created temporary share \\$($d.Host)\$($d.Name) -> $($d.Path) ($($d.Access) for $($d.Account))." 'OK'
+    if (-not (Test-Path -LiteralPath "\\$($d.Host)\$($d.Name)")) { throw "The share was created but this PC cannot open \\$($d.Host)\$($d.Name) (NTFS rights on $($d.Path)?). It will be removed." }
+}
+
+function Remove-CreatedShare {
+    param($d)
+    $key = "$($d.Host)|$($d.Name)"
+    if (-not $script:CreatedShares.ContainsKey($key)) { Write-Log "Share $($d.Name) on $($d.Host) was not created by this run; nothing to remove." 'INFO'; return }
+    $cim = Get-HostCim $d.Host
+    $sh = Get-SmbShare -CimSession $cim -Name $d.Name -ErrorAction SilentlyContinue
+    if (-not $sh) { Write-Log "Share $($d.Name) on $($d.Host) is already gone." 'INFO' }
+    elseif ([string]$sh.Path.TrimEnd('\') -ine $d.Path.TrimEnd('\')) { throw "Share $($d.Name) on $($d.Host) now points at $($sh.Path), not $($d.Path); it was NOT removed. Check it by hand." }
+    else {
+        Remove-SmbShare -CimSession $cim -Name $d.Name -Force -ErrorAction Stop
+        Write-Log "Removed temporary share \\$($d.Host)\$($d.Name). The folder $($d.Path) and its files are kept." 'OK'
+    }
+    [void]$script:CreatedShares.Remove($key)
+}
+
+function Invoke-ShareRemoveStep {
+    param($Step)
+    $err = @()
+    foreach ($d in $Step.Data.Specs) {
+        try { Remove-CreatedShare $d } catch { $err += $_.Exception.Message; Write-Log $_.Exception.Message 'FAIL' }
+    }
+    if ($err.Count) { throw ($err -join ' | ') }
+}
+
+# Safety net: removes any share this run created that is still there (failure, closing the window)
+function Remove-LeftoverShares {
+    foreach ($k in @($script:CreatedShares.Keys)) {
+        $d = $script:CreatedShares[$k]
+        try { Remove-CreatedShare $d } catch { Write-Log "Could not remove share $($d.Name) on $($d.Host): $($_.Exception.Message). Remove it by hand: Remove-SmbShare -Name '$($d.Name)' on $($d.Host)." 'FAIL' }
+    }
+}
+
+function Invoke-FetchStep {
+    param($Step)
+    $t = Invoke-Sql $script:State.SrcConn (Get-StepCode $Step) -Timeout 120
+    if ($t.Rows.Count -ne 1) { throw "Certificate [$($Step.Data.Name)] with thumbprint $($Step.Data.Thumb) was not found on the source." }
+    $cer = $t.Rows[0]['cer']; $pvk = $t.Rows[0]['pvk']
+    if ($cer -is [System.DBNull]) { $cer = $null }
+    if ($pvk -is [System.DBNull]) { $pvk = $null }
+    if (-not $cer) { throw "CERTENCODED returned NULL for [$($Step.Data.Name)]." }
+    if (-not $pvk) { throw "CERTPRIVATEKEY returned NULL for [$($Step.Data.Name)]: your login needs CONTROL on the certificate, and the private key must be protected by the master key." }
+    $sha = New-Object System.Security.Cryptography.SHA1Managed
+    try { $h = ConvertTo-HexLiteral ($sha.ComputeHash([byte[]]$cer)) } finally { $sha.Dispose() }
+    if ($h -ne $Step.Data.Thumb.ToUpper().Replace('0X', '0x')) { throw "The SHA-1 of the certificate bytes ($h) does not match the thumbprint $($Step.Data.Thumb). Nothing was changed; use the file method for this certificate." }
+    $script:Blobs[$Step.Data.Thumb] = @{ Cer = [byte[]]$cer; Pvk = [byte[]]$pvk }
+    Write-Log ("Read certificate [{0}]: {1:N0} bytes, encrypted private key {2:N0} bytes, SHA-1 matches the thumbprint." -f $Step.Data.Name, $cer.Length, $pvk.Length) 'OK'
+}
+
+function Clear-Blobs {
+    foreach ($k in @($script:Blobs.Keys)) {
+        $b = $script:Blobs[$k]
+        foreach ($a in @($b.Cer, $b.Pvk)) { if ($a) { [System.Array]::Clear($a, 0, $a.Length) } }
+    }
+    $script:Blobs = @{}
 }
 
 function Test-ExecuteInputs {
@@ -633,7 +857,7 @@ function Invoke-Plan {
     $failed = $null; $done = 0
     try {
         foreach ($s in $Plan.Steps) {
-            if ($failed) { if ($s.Status -eq 'Planned') { Set-StepStatus $s 'Not run' } ; continue }
+            if ($failed -and -not ($s.AlwaysRun -and $s.Status -eq 'Planned')) { if ($s.Status -eq 'Planned') { Set-StepStatus $s 'Not run' } ; continue }
             if ($s.Status -eq 'Skip') { Set-StepStatus $s 'Skipped'; continue }
             if ($s.Status -ne 'Planned') { continue }
             Set-StepStatus $s 'Running'
@@ -654,6 +878,9 @@ function Invoke-Plan {
                     }
                     'Copy'   { Invoke-CopyStep $s }
                     'Delete' { Invoke-DeleteStep $s }
+                    'ShareCreate' { Invoke-ShareCreateStep $s }
+                    'Fetch'       { Invoke-FetchStep $s }
+                    'ShareRemove' { Invoke-ShareRemoveStep $s }
                 }
                 $sw.Stop()
                 Set-StepStatus $s 'Done' ("{0:N1}s" -f $sw.Elapsed.TotalSeconds)
@@ -664,20 +891,25 @@ function Invoke-Plan {
                 foreach ($m in $script:SqlMessages) { Write-Log "  $m" 'INFO' }
                 Set-StepStatus $s 'Failed' $msg
                 Write-Log "Step $($s.No) FAILED: $msg" 'FAIL'
-                $failed = $s
+                if (-not $failed) { $failed = $s }
             }
             $done++; $progress.Value = [Math]::Min($progress.Maximum, $done)
             [System.Windows.Forms.Application]::DoEvents()
         }
     }
-    finally { $script:Running = $false; Set-Busy $false }
+    finally {
+        Clear-Blobs
+        Remove-LeftoverShares
+        Close-HostCims
+        $script:Running = $false; Set-Busy $false
+    }
 
     if ($failed) {
         $lblProg.Text = "FAILED at step $($failed.No). Remaining steps were not run."
         Write-Log "===== EXECUTE stopped at step $($failed.No). Steps after it were NOT run. =====" 'FAIL'
         $hint = ''
-        if (@($Plan.Steps | Where-Object { $_.Status -eq 'Done' -and ($_.Kind -eq 'Copy' -or $_.Title -like 'Back up*') }).Count) {
-            $hint = "`r`n`r`nCertificate files were already written. They hold the private key: secure or delete them ($($Plan.SrcUnc), $($Plan.DstUnc))."
+        if ($Plan.Method -eq 1 -and @($Plan.Steps | Where-Object { $_.Status -eq 'Done' -and ($_.Kind -eq 'Copy' -or $_.Title -like 'Back up*') }).Count) {
+            $hint = "`r`n`r`nCertificate files were already written. They hold the private key: secure or delete them ($($Plan.SrcSql) on $($Plan.Src.HostName), $($Plan.DstSql) on $($Plan.Dst.HostName))."
         }
         [void][System.Windows.Forms.MessageBox]::Show("Step $($failed.No) failed:`r`n$($failed.Title)`r`n`r`n$($failed.Result)`r`n`r`nThe steps after it were not run. See the Log tab.$hint", $script:AppName, 'OK', 'Error')
     } else {
@@ -689,7 +921,8 @@ function Invoke-Plan {
         [void]$next.AppendLine("$($moved.Count) certificate(s) are now on $($Plan.Dst.ServerName) with matching thumbprints.")
         [void]$next.AppendLine('')
         [void]$next.AppendLine('Next steps:')
-        [void]$next.AppendLine(" - The export ($($Plan.SrcUnc)) holds the certificate AND private key: move it to a safe place.")
+        if ($Plan.Method -eq 1) { [void]$next.AppendLine(" - The export ($($Plan.SrcSql) on $($Plan.Src.HostName)) holds the certificate AND private key: move it to a safe place.") }
+        else { [void]$next.AppendLine(' - No files were written. If you also want a .cer/.pvk backup to keep in a vault, run the file method once.') }
         [void]$next.AppendLine(' - Keep the certificate password in your vault: it is needed to restore these files anywhere else.')
         if (@($Plan.Steps | Where-Object { $_.Title -eq 'Create the database master key in master' -and $_.Status -eq 'Done' }).Count) {
             [void]$next.AppendLine(' - A database master key was created: back it up (BACKUP MASTER KEY TO FILE = ... ENCRYPTION BY PASSWORD = ...).')
@@ -941,7 +1174,9 @@ $gridDst.ReadOnly = $true
 $gridDst.Anchor = 'Top,Bottom,Left,Right'
 
 # ---------- tab 3: transfer ----------
-$gFold = New-Group $tabXfer 'Folders' 10 8 1150 200
+$gMeth = New-Group $tabXfer 'Transfer method' 10 8 1150 56
+$cboMethod = New-Combo $gMeth 10 22 1130 @('Direct (recommended): certificate and encrypted private key travel over the two SQL connections - no folders, files or shares (SQL Server 2012+)', 'Files: BACKUP CERTIFICATE to a folder, copy to the destination folder, CREATE CERTIFICATE FROM FILE (needs folder and share access)')
+$gFold = New-Group $tabXfer 'Folders (file method only)' 10 72 1150 200
 [void](New-Label $gFold 'Export folder on the SOURCE (as the source SQL Server sees it)' 10 24 400)
 $txtSrcFolder = New-TextBox $gFold 415 24 540
 [void](New-Label $gFold '   same folder, as THIS PC reaches it' 10 54 400)
@@ -950,12 +1185,13 @@ $txtSrcUnc = New-TextBox $gFold 415 54 540
 $txtDstFolder = New-TextBox $gFold 415 92 540
 [void](New-Label $gFold '   same folder, as THIS PC reaches it' 10 122 400)
 $txtDstUnc = New-TextBox $gFold 415 122 540
-$chkAutoUnc = New-Check $gFold 'Work out the THIS PC paths automatically (admin share \\host\X$\...); untick to type your own share' 10 158 800 $true
+[void](New-Label $gFold 'How THIS PC reaches the folders' 10 154 200)
+$cboReach = New-Combo $gFold 215 154 740 @('Temporary shares: created on each folder for the copy, removed when done (folders kept)', 'Admin shares (\\host\X$\...): I am a local admin on both hosts', 'Paths I type in the boxes above')
 $btnResetFold = New-Button $gFold 'Use instance backup folders' 965 22 175
 [void](New-Label $gFold 'Default: <instance default backup folder>\TDE_Migration. The SQL Server service creates the folder itself, so it has the rights it needs.' 10 178 1130 20)
 
-$gPwd = New-Group $tabXfer 'Private key password' 10 216 1150 120
-[void](New-Label $gPwd 'Used for ENCRYPTION BY PASSWORD when the private key is backed up on the source, and DECRYPTION BY PASSWORD when it is created on the destination.' 10 20 1130 22)
+$gPwd = New-Group $tabXfer 'Private key password' 10 280 1150 120
+[void](New-Label $gPwd 'Encrypts the private key while it leaves the source (CERTPRIVATEKEY / BACKUP CERTIFICATE) and decrypts it on the destination (CREATE CERTIFICATE ... DECRYPTION BY PASSWORD).' 10 20 1130 22)
 [void](New-Label $gPwd 'Password' 10 50 70)
 $txtCertPwd = New-TextBox $gPwd 85 50 260 -Password
 [void](New-Label $gPwd 'Confirm' 360 50 60)
@@ -963,7 +1199,7 @@ $txtCertPwd2 = New-TextBox $gPwd 425 50 260 -Password
 $chkShowPwd = New-Check $gPwd 'Show passwords' 700 50 150
 [void](New-Label $gPwd 'Keep it in your password vault together with the .cer/.pvk files: without it the private key cannot be restored. At least 8 characters; SQL Server also applies the Windows password policy. Not needed for What-If.' 10 80 1130 34)
 
-$gOpt = New-Group $tabXfer 'After the run' 10 344 1150 84
+$gOpt = New-Group $tabXfer 'After the run (file method only)' 10 408 1150 84
 $chkDeleteDest = New-Check $gOpt 'After the verify step passes, delete the copies this run put in the destination import folder (the source export is always kept)' 10 22 1100
 [void](New-Label $gOpt 'File names: <certificate>_<yyyyMMdd_HHmmss>.cer / .pvk - a new name every run, so no file is ever overwritten.' 10 50 1100 22)
 
@@ -1009,13 +1245,22 @@ $txtLog = New-Mono; $txtLog.Dock = 'Fill'; $tabLog.Controls.Add($txtLog)
 
 #region ============================ UI logic ============================
 
+function Get-SharePreview {
+    param([string]$Path, [string]$HostName, [string]$Tag)
+    if (-not $Path) { return '' }
+    if ($Path.Trim() -match '^\\\\' -or -not $HostName -or $HostName -ieq $env:COMPUTERNAME) { return (Get-UncPath $Path $HostName) }
+    return "\\$HostName\TDEMIG_$($Tag)_<time stamp>`$     (temporary share: created by the run, removed when done)"
+}
+
 function Update-Unc {
-    if (-not $chkAutoUnc.Checked) { return }
     $sh = $null; $dh = $null
     if ($script:State.Src) { $sh = $script:State.Src.HostName }
     if ($script:State.Dst) { $dh = $script:State.Dst.HostName }
-    $txtSrcUnc.Text = Get-UncPath $txtSrcFolder.Text $sh
-    $txtDstUnc.Text = Get-UncPath $txtDstFolder.Text $dh
+    switch ($cboReach.SelectedIndex) {
+        0 { $txtSrcUnc.Text = Get-SharePreview $txtSrcFolder.Text $sh 'SRC'; $txtDstUnc.Text = Get-SharePreview $txtDstFolder.Text $dh 'DST' }
+        1 { $txtSrcUnc.Text = Get-UncPath $txtSrcFolder.Text $sh; $txtDstUnc.Text = Get-UncPath $txtDstFolder.Text $dh }
+        default { }
+    }
 }
 
 function Get-DefaultFolder {
@@ -1092,7 +1337,9 @@ $gridSrc.Add_CurrentCellDirtyStateChanged({ if ($gridSrc.IsCurrentCellDirty) { [
 
 $txtSrcFolder.Add_TextChanged({ Update-Unc })
 $txtDstFolder.Add_TextChanged({ Update-Unc })
-$chkAutoUnc.Add_CheckedChanged({ $txtSrcUnc.ReadOnly = $chkAutoUnc.Checked; $txtDstUnc.ReadOnly = $chkAutoUnc.Checked; Update-Unc })
+$cboMethod.Add_SelectedIndexChanged({ $on = ($cboMethod.SelectedIndex -eq 1); $gFold.Enabled = $on; $gOpt.Enabled = $on })
+$gFold.Enabled = $false; $gOpt.Enabled = $false
+$cboReach.Add_SelectedIndexChanged({ $ro = ($cboReach.SelectedIndex -ne 2); $txtSrcUnc.ReadOnly = $ro; $txtDstUnc.ReadOnly = $ro; Update-Unc })
 $txtSrcUnc.ReadOnly = $true; $txtDstUnc.ReadOnly = $true
 $btnResetFold.Add_Click({
     if ($script:State.Src) { $txtSrcFolder.Text = Get-DefaultFolder $script:State.Src }
@@ -1140,7 +1387,9 @@ $form.Add_FormClosing({
     if ($script:Running) {
         [void][System.Windows.Forms.MessageBox]::Show('A run is in progress. Wait for it to finish.', $script:AppName, 'OK', 'Warning')
         $e.Cancel = $true
+        return
     }
+    if ($script:CreatedShares.Count) { Remove-LeftoverShares; Close-HostCims }
 })
 
 $form.Add_Shown({
