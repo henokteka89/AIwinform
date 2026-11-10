@@ -5,6 +5,10 @@
 
 A WinForms GUI that moves **TDE certificates with their private keys** from a source SQL Server to a destination SQL Server, so encrypted databases (or their backups) can be restored or attached on the destination.
 
+**Two transfer methods**
+- **Direct (default, SQL Server 2012+):** the certificate and its private key go over the two SQL connections, with the key encrypted by your password: `CERTENCODED` / `CERTPRIVATEKEY` on the source, then `CREATE CERTIFICATE ... FROM BINARY` on the destination. **No folders, files, shares or copy**, so Windows "access denied" errors on folders such as `C:\TDE\Backup` can't happen. The bytes stay only in the tool's memory and are cleared when the run ends. Before anything is created, the tool checks that the SHA-1 of the certificate bytes equals the thumbprint.
+- **Files:** `BACKUP CERTIFICATE` to `.cer` / `.pvk` files, copy them, then `CREATE CERTIFICATE ... FROM FILE`. Use this for SQL Server 2008 R2 or older, or when you also want key files to keep in a vault.
+
 **What-If by default.** It shows every step, the exact T-SQL or file operation, the server it runs on and what it does. Nothing changes until you pick **Execute** and type the destination server name to confirm.
 
 ## Start
@@ -20,10 +24,22 @@ Get-ChildItem C:\Apps\TdeCertMigration | Unblock-File
 |---|---|
 | **1. Source** | Connect (Windows or SQL login, optional encryption). Lists the certificates in `master` with thumbprint, expiry, private-key protection and the databases that use each one for TDE. Certificates used by TDE are ticked for you. |
 | **2. Destination** | Connect. Shows whether `master` has a **database master key (DMK)** and whether the service master key encrypts it. If there's no DMK, tick **Create the database master key** and enter a password. Lists the certificates already on the destination. Choose what happens when a *different* certificate has the same name: **Stop** (the default) or create it with a suffix. |
-| **3. Transfer and password** | Export folder (as the source SQL Server sees it) and import folder (as the destination sees it). **How this PC reaches them:** **temporary shares** (the default, see below), admin shares `\\host\X$\...`, or paths you type. Also the **private-key password**, used for `ENCRYPTION BY PASSWORD` on the source and `DECRYPTION BY PASSWORD` on the destination. |
+| **3. Transfer and password** | **Transfer method** (Direct or Files) and the **private-key password**. File method only: export folder (as the source SQL Server sees it) and import folder (as the destination sees it). **How this PC reaches them:** **temporary shares** (the default, see below), admin shares `\\host\X$\...`, or paths you type. Also the **private-key password**, used for `ENCRYPTION BY PASSWORD` on the source and `DECRYPTION BY PASSWORD` on the destination. |
 | **4. Plan and run** | **What-If** fills the step grid. Click a step to see what it does, where it runs, which login it runs as, and its script. The full plan appears as one SQLCMD-mode script with the passwords masked, and you can save it. **Execute** runs the same plan with a progress bar and colours each step's status. It stops at the first failure and writes everything to the log. |
 
-## Steps (in this order)
+## Steps, direct method
+| # | Runs on | Step | Changes? |
+|---|---|---|---|
+| 1 | Source | Check that each certificate exists with the same thumbprint and a private key protected by the master key | no |
+| 2 | Destination | Check the DMK (and its password if needed) | no |
+| 3 | Source | `SELECT CERTENCODED(...), CERTPRIVATEKEY(..., <password>)` into memory, then check that the SHA-1 equals the thumbprint | no |
+| 4 | Destination | `CREATE MASTER KEY`, only if there is none **and** you ticked the option | DMK |
+| 5 | Destination | `CREATE CERTIFICATE ... FROM BINARY = 0x... WITH PRIVATE KEY (BINARY = 0x..., DECRYPTION BY PASSWORD ...)` | certificate |
+| 6 | Destination | Verify that the thumbprints match and that the private key is protected by the master key | no |
+
+In What-If and the saved script, the bytes appear as `<<CERTIFICATE_BYTES_FROM_SOURCE>>` / `<<ENCRYPTED_PRIVATE_KEY_BYTES_FROM_SOURCE>>`.
+
+## Steps, file method (in this order)
 | # | Runs on | Step | Changes? |
 |---|---|---|---|
 | 1 | Source | Check that each certificate still exists with the same thumbprint and a private key protected by the master key | no |
