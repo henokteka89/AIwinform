@@ -32,7 +32,7 @@
 
 $ErrorActionPreference = 'Stop'
 $script:AppName = 'PITR Restore Builder'
-$script:Version = '1.6.2'
+$script:Version = '1.7'
 
 #region ============================ general helpers ============================
 
@@ -271,10 +271,17 @@ function ConvertTo-BackupSet {
 }
 
 function Get-BackupChain {
-    param([hashtable]$Conn, [string]$Db, [datetime]$StopAt, [string]$Mode, [int]$PinnedFullId = 0, [int]$SrcMajor = 13, [string]$ServerFilter = '')
+    param([hashtable]$Conn, [string]$Db, [datetime]$StopAt, [string]$Mode, [int]$PinnedFullId = 0, [int]$SrcMajor = 13, [string]$ServerFilter = '',
+          $ContinueLsn = $null, $DiffBaseLsn = $null)
     $warn = New-Object System.Collections.Generic.List[string]
+    $fmt = 'yyyy-MM-dd hh:mm:ss tt'
+    $full = $null
+    $isContinue = ($Mode -like 'Continue*')
+    if ($isContinue -and -not $ContinueLsn) { throw 'Continue mode needs the redo point (redo_start_lsn) of the RESTORING target database on the destination.' }
 
-    # ---- FULL ----
+    # ---- FULL (skipped when continuing a restore that already has its FULL) ----
+    if ($isContinue) { $eff = $Mode }
+    else {
     if ($PinnedFullId -gt 0) {
         $q = (Get-BsSelect $SrcMajor '' $ServerFilter) + " AND bs.type = 'D' AND bs.backup_set_id = @id;"
         $rows = Invoke-Sql $Conn $q @{ db = $Db; id = $PinnedFullId }
@@ -305,9 +312,27 @@ function Get-BackupChain {
         if ($full.RecoveryModel -eq 'SIMPLE') { $eff = 'FullDiff'; $warn.Add('Database was in SIMPLE recovery at FULL time: no log backups, using FULL + DIFF.') }
         else { $eff = 'FullDiffLog' }
     }
+    }   # end of FULL section
+
+    # ---- DIFF when continuing: newest DIFF on the restored FULL, newer than the current restore point ----
+    $diff = $null
+    if ($eff -eq 'ContinueDiff' -or $eff -eq 'ContinueDiffLog') {
+        if (-not $DiffBaseLsn) { $warn.Add('The differential base of the RESTORING database is unknown; DIFF skipped.') }
+        else {
+            $q = (Get-BsSelect $SrcMajor 'TOP (20)' $ServerFilter) + " AND bs.type = 'I' AND bs.backup_finish_date <= @stop AND bs.database_backup_lsn = @base AND bs.last_lsn > @redo ORDER BY bs.backup_finish_date DESC;"
+            $rows = Invoke-Sql $Conn $q @{ db = $Db; stop = $StopAt; base = [decimal]$DiffBaseLsn; redo = [decimal]$ContinueLsn }
+            foreach ($d in @($rows.Rows | ForEach-Object { ConvertTo-BackupSet $_ } | Sort-Object Finish -Descending)) {
+                if ($d.IsDamaged -or $d.IsSnapshot) { $warn.Add("Skipped DIFF id $($d.Id) (damaged or snapshot)."); continue }
+                $diff = $d; break
+            }
+        }
+        if (-not $diff) {
+            if ($eff -eq 'ContinueDiff') { throw ("No DIFF found that is based on the FULL already restored (differential base LSN $DiffBaseLsn), is newer than the current restore point (LSN $ContinueLsn) and finished before STOPAT " + $StopAt.ToString($fmt) + '.') }
+            $warn.Add('No newer DIFF on the restored FULL before STOPAT; continuing with LOGs only.')
+        }
+    }
 
     # ---- DIFF ----
-    $diff = $null
     if ($eff -eq 'FullDiff' -or $eff -eq 'FullDiffLog') {
         if ($full.IsCopyOnly) { $warn.Add('Selected FULL is COPY_ONLY: it cannot be a differential base, DIFFs skipped.') }
         else {
@@ -323,8 +348,10 @@ function Get-BackupChain {
 
     # ---- LOGS ----
     $logs = @(); $usesStop = $false
-    if ($eff -eq 'FullDiffLog') {
-        $base = if ($diff) { $diff } else { $full }
+    if ($eff -eq 'FullDiffLog' -or $eff -eq 'ContinueDiffLog' -or $eff -eq 'ContinueLog') {
+        if ($diff) { $base = $diff }
+        elseif ($full) { $base = $full }
+        else { $base = [pscustomobject]@{ Type = 'current restore point of the RESTORING database'; Id = '-'; Finish = $null; LastLsn = [decimal]$ContinueLsn; LastFork = $null } }
         $f2 = $ServerFilter -replace 'bs\.', 'b2.'
         $q = (Get-BsSelect $SrcMajor '' $ServerFilter) + @"
  AND bs.type = 'L' AND bs.last_lsn > @startLsn
@@ -362,12 +389,13 @@ ORDER BY bs.first_lsn, bs.backup_finish_date;
     }
 
     $sets = New-Object System.Collections.Generic.List[object]
-    $sets.Add($full)
+    if ($full) { $sets.Add($full) }
     if ($diff) { $sets.Add($diff) }
     foreach ($l in $logs) { $sets.Add($l) }
+    if ($sets.Count -eq 0) { throw 'Nothing to restore for this mode and STOPAT.' }
     $n = 0; foreach ($s in $sets) { $n++; $s.Step = $n }
     $last = $sets[$sets.Count - 1]
-    if ($eff -ne 'FullDiffLog') { $warn.Add("Mode $eff restores to the end of the last backup ($($last.Finish)); STOPAT is only used to choose the backups.") }
+    if ($eff -eq 'FullOnly' -or $eff -eq 'FullDiff' -or $eff -eq 'ContinueDiff') { $warn.Add("Mode $eff restores to the end of the last backup ($($last.Finish)); STOPAT is only used to choose the backups.") }
     return [pscustomobject]@{
         Sets = $sets; Warnings = $warn; Mode = $eff; UsesStopAt = $usesStop; StopAt = $StopAt
         RestorePoint = $(if ($usesStop) { $StopAt } else { $last.Finish })
@@ -382,6 +410,7 @@ function Get-ChainSummary {
 
 function Get-BackupFiles {
     param([hashtable]$Conn, $Chain)
+    if ($Chain.Sets[0].Type -ne 'FULL') { return [pscustomobject]@{ Files = @(); AddedLater = @() } }
     $fullId = $Chain.Sets[0].Id
     $t = Invoke-Sql $Conn @"
 SELECT bf.logical_name, bf.physical_name, bf.file_type, bf.file_number, bf.file_size, bf.filegroup_name
@@ -429,7 +458,8 @@ SELECT @@SERVERNAME AS ServerName, SYSDATETIME() AS ServerTime,
         DefaultData = [string](DbVal $r.DefaultData); DefaultLog = [string](DbVal $r.DefaultLog); ErrorLogFile = [string](DbVal $r.ErrorLogFile)
         ServiceAccount = $null; AgentStatus = $null; AvailMB = $null; TotalMB = $null
         TargetExists = $false; TargetState = $null; TargetInAg = $false
-        Certs = @(); HasDmk = $false; Credentials = @(); UserFiles = @(); Volumes = @(); FixedDrives = @()
+        Certs = @(); HasDmk = $false; Credentials = @(); UserFiles = @(); Volumes = @(); FixedDrives = @(); Drives = @()
+        TargetRedoLsn = $null; TargetDiffBaseLsn = $null; TargetLastRestore = $null
     }
     try {
         foreach ($s in (Invoke-Sql $Conn 'SELECT servicename, service_account, status_desc FROM sys.dm_server_services;').Rows) {
@@ -448,6 +478,22 @@ SELECT @@SERVERNAME AS ServerName, SYSDATETIME() AS ServerTime,
             try {
                 $a = Invoke-Sql $Conn 'SELECT CASE WHEN replica_id IS NULL THEN 0 ELSE 1 END AS in_ag FROM sys.databases WHERE name = @t;' @{ t = $Target }
                 $d.TargetInAg = ([int]$a.Rows[0].in_ag -eq 1)
+            } catch { }
+            try {
+                $rl = Invoke-Sql $Conn 'SELECT redo_start_lsn, differential_base_lsn FROM sys.master_files WHERE database_id = DB_ID(@t) AND file_id = 1;' @{ t = $Target }
+                if ($rl.Rows.Count) { $d.TargetRedoLsn = DbVal $rl.Rows[0].redo_start_lsn; $d.TargetDiffBaseLsn = DbVal $rl.Rows[0].differential_base_lsn }
+            } catch { }
+            try {
+                $lr = Invoke-Sql $Conn @"
+SELECT TOP (1) rh.restore_date, rh.restore_type, bs.backup_finish_date
+FROM msdb.dbo.restorehistory rh LEFT JOIN msdb.dbo.backupset bs ON bs.backup_set_id = rh.backup_set_id
+WHERE rh.destination_database_name = @t ORDER BY rh.restore_history_id DESC;
+"@ @{ t = $Target }
+                if ($lr.Rows.Count) {
+                    $x = $lr.Rows[0]
+                    $rt = switch ([string]$x.restore_type) { 'D' { 'FULL' } 'I' { 'DIFF' } 'L' { 'LOG' } default { [string]$x.restore_type } }
+                    $d.TargetLastRestore = '{0} restored {1:yyyy-MM-dd hh:mm:ss tt} (backup finished {2})' -f $rt, ([datetime]$x.restore_date), $(if ($x.backup_finish_date -is [datetime]) { $x.backup_finish_date.ToString('yyyy-MM-dd hh:mm:ss tt') } else { '?' })
+                }
             } catch { }
         }
     }
@@ -477,7 +523,51 @@ FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.f
         $d.FixedDrives = @((Invoke-Sql $Conn 'EXEC master.dbo.xp_fixeddrives;').Rows |
                            ForEach-Object { [pscustomobject]@{ Drive = [string]$_[0]; FreeMB = [double]$_[1] } })
     } catch { }
+    try { $d.Drives = @(Get-DestDrives $Conn) } catch { }
     return $d
+}
+
+# Drives and mount points on the destination with free/total space (read-only DMVs; xp_fixeddrives fallback)
+function Get-DestDrives {
+    param([hashtable]$Conn)
+    $list = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($r in (Invoke-Sql $Conn 'SELECT fixed_drive_path, free_space_in_bytes FROM sys.dm_os_enumerate_fixed_drives;').Rows) {
+            $root = [string]$r.fixed_drive_path; if (-not $root.EndsWith('\')) { $root += '\' }
+            if ($seen.Add($root)) { $list.Add([pscustomobject]@{ Root = $root; FreeBytes = [double]$r.free_space_in_bytes; TotalBytes = $null }) }
+        }
+    } catch {
+        try {
+            foreach ($r in (Invoke-Sql $Conn 'EXEC master.dbo.xp_fixeddrives;').Rows) {
+                $root = ([string]$r[0]) + ':\'
+                if ($seen.Add($root)) { $list.Add([pscustomobject]@{ Root = $root; FreeBytes = [double]$r[1] * 1MB; TotalBytes = $null }) }
+            }
+        } catch { }
+    }
+    try {
+        $q = 'SELECT DISTINCT vs.volume_mount_point, vs.available_bytes, vs.total_bytes FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs;'
+        foreach ($r in (Invoke-Sql $Conn $q).Rows) {
+            $root = [string]$r.volume_mount_point
+            $ex = $null
+            foreach ($e in $list) { if ($e.Root -eq $root) { $ex = $e } }
+            if ($ex) { $ex.FreeBytes = [double]$r.available_bytes; $ex.TotalBytes = [double]$r.total_bytes }
+            elseif ($seen.Add($root)) { $list.Add([pscustomobject]@{ Root = $root; FreeBytes = [double]$r.available_bytes; TotalBytes = [double]$r.total_bytes }) }
+        }
+    } catch { }
+    return @($list | Sort-Object Root)
+}
+
+# Subfolders of a destination folder, as the SQL Server service account sees them
+function Get-DestSubfolders {
+    param([hashtable]$Conn, [string]$Path)
+    $names = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($r in (Invoke-Sql $Conn 'EXEC master.sys.xp_dirtree @p, 1, 0;' @{ p = $Path }).Rows) { $names.Add([string]$r.subdirectory) }
+    } catch {
+        foreach ($r in (Invoke-Sql $Conn "SELECT file_or_directory_name FROM sys.dm_os_enumerate_filesystem(@p, N'*') WHERE is_directory = 1;" @{ p = $Path }).Rows) { $names.Add([string]$r.file_or_directory_name) }
+    }
+    return @($names | Sort-Object)
 }
 
 function Get-VolumeFor {
@@ -506,6 +596,18 @@ function Get-MovePlan {
 
     if ($Strategy -like 'Manual*' -and (-not $DataDir -or -not $LogDir)) { throw 'MOVE strategy "Manual": enter at least the data (mdf) folder and the log (ldf) folder.' }
 
+    if ($Strategy -like 'Largest*') {
+        $big = @($Dest.Drives | Sort-Object FreeBytes -Descending)
+        if ($big.Count) {
+            $dv = $big[0]
+            $why = 'largest free disk {0} ({1:N0} GB free)' -f $dv.Root, ($dv.FreeBytes / 1GB)
+            $onIt = @($userFiles | Where-Object { $_.Path.StartsWith($dv.Root, [StringComparison]::OrdinalIgnoreCase) })
+            $g = $onIt | Where-Object { $_.Type -eq 0 } | Group-Object { Get-DirOf $_.Path } | Sort-Object Count -Descending | Select-Object -First 1
+            if ($g) { $dData = $g.Name; $whyD = "$why, folder already used for data files" } else { $dData = $dv.Root; $whyD = "$why, drive ROOT - pick a subfolder with the ... button" }
+            $g = $onIt | Where-Object { $_.Type -eq 1 } | Group-Object { Get-DirOf $_.Path } | Sort-Object Count -Descending | Select-Object -First 1
+            if ($g) { $dLog = $g.Name; $whyL = "$why, folder already used for log files" } else { $dLog = $dData; $whyL = $whyD }
+        }
+    }
     if ($Strategy -like 'Auto*') {
         if ($Pattern) {
             $sim = @($userFiles | Where-Object { $_.Db -like "*$Pattern*" })
@@ -748,7 +850,12 @@ function Invoke-Preflight {
     if ($d.IsSysadmin -or $d.CanCreateDb) { Add-Check 'PASS' 'Permissions' 'CREATE ANY DATABASE / sysadmin present (needed for HEADERONLY and RESTORE).' }
     else { Add-Check 'FAIL' 'Permissions' 'Your login lacks CREATE ANY DATABASE on the destination.' 'Use a login in dbcreator or sysadmin.' }
 
-    if ($d.TargetExists) {
+    if ($c.Mode -like 'Continue*') {
+        if (-not $d.TargetExists) { Add-Check 'FAIL' 'Target database' "[$($o.Target)] does not exist on the destination. Continue modes need a database that is already RESTORING." 'Use the Restoring DBs button on tab 1, or restore a FULL first.' }
+        elseif ($d.TargetState -ne 'RESTORING') { Add-Check 'FAIL' 'Target database' "[$($o.Target)] is $($d.TargetState), not RESTORING, so no DIFF or LOG can be applied." 'It was recovered already. Start again with a FULL (WITH REPLACE or a new name).' }
+        else { Add-Check 'PASS' 'Target database' "[$($o.Target)] is RESTORING; next restore starts at LSN $($d.TargetRedoLsn). Last restore: $($d.TargetLastRestore)" }
+    }
+    elseif ($d.TargetExists) {
         if ($d.TargetInAg) { Add-Check 'FAIL' 'Target database' "[$($o.Target)] exists and is in an availability group." 'Remove it from the AG first, or restore under another name.' }
         elseif ($o.Replace) { Add-Check 'WARN' 'Target database' "[$($o.Target)] exists ($($d.TargetState)) and WITH REPLACE will overwrite it." }
         else { Add-Check 'FAIL' 'Target database' "[$($o.Target)] already exists ($($d.TargetState))." 'Pick another target name, or tick WITH REPLACE.' }
@@ -974,7 +1081,11 @@ function New-SsmsScript {
     $srvMsg = ("STOP: connected to %s, but this script is for {0}." -f $d.ServerName).Replace('%s', '#S#').Replace('%', '%%').Replace('#S#', '%s')
     [void]$sb.AppendLine("IF @@SERVERNAME <> $(QS $d.ServerName) BEGIN RAISERROR($(QS $srvMsg), 16, 1, @@SERVERNAME) WITH NOWAIT; SET NOEXEC ON; END")
     [void]$sb.AppendLine('GO')
-    if (-not $o.Replace) {
+    if ($script:State.Chain.Mode -like 'Continue*') {
+        $m = ("STOP: database [{0}] is not in RESTORING state, so DIFF/LOG restores cannot continue." -f $o.Target).Replace('%', '%%')
+        [void]$sb.AppendLine("IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = $(QS $o.Target) AND state_desc = N'RESTORING') BEGIN RAISERROR($(QS $m), 16, 1) WITH NOWAIT; SET NOEXEC ON; END")
+        [void]$sb.AppendLine('GO')
+    } elseif (-not $o.Replace) {
         $m = ("STOP: database [{0}] already exists. Use another name or regenerate with REPLACE." -f $o.Target).Replace('%', '%%')
         [void]$sb.AppendLine("IF DB_ID($(QS $o.Target)) IS NOT NULL BEGIN RAISERROR($(QS $m), 16, 1) WITH NOWAIT; SET NOEXEC ON; END")
         [void]$sb.AppendLine('GO')
@@ -1016,7 +1127,10 @@ function New-JobScript {
     [void]$guard.AppendLine('SET NOCOUNT ON;')
     $srvMsg = ("Wrong server %s - this job was generated for {0}." -f $d.ServerName).Replace('%s', '#S#').Replace('%', '%%').Replace('#S#', '%s')
     [void]$guard.AppendLine("IF @@SERVERNAME <> $(QS $d.ServerName) BEGIN RAISERROR($(QS $srvMsg), 16, 1, @@SERVERNAME); RETURN; END")
-    if (-not $o.Replace) {
+    if ($script:State.Chain.Mode -like 'Continue*') {
+        $m = ("Database [{0}] is not RESTORING - job stopped (continue mode)." -f $o.Target).Replace('%', '%%')
+        [void]$guard.AppendLine("IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = $(QS $o.Target) AND state_desc = N'RESTORING') BEGIN RAISERROR($(QS $m), 16, 1); RETURN; END")
+    } elseif (-not $o.Replace) {
         $m = ("Database [{0}] already exists - job stopped (REPLACE not chosen)." -f $o.Target).Replace('%', '%%')
         [void]$guard.AppendLine("IF DB_ID($(QS $o.Target)) IS NOT NULL BEGIN RAISERROR($(QS $m), 16, 1); RETURN; END")
     }
@@ -1490,11 +1604,12 @@ $lblDstTime = New-Label $gDst 'Destination server time: (run preflight)' 10 116 
 New-Label $tab1 'Source database' 10 168 120
 $cboDb = New-Combo $tab1 135 168 300 @() -Editable
 New-Label $tab1 'Restore as (target)' 450 168 130
-$txtTarget = New-TextBox $tab1 585 168 380
-$btnDefName = New-Button $tab1 'Default name' 975 166 110
+$txtTarget = New-TextBox $tab1 585 168 320
+$btnDefName = New-Button $tab1 'Default name' 912 166 100
+$btnRestoring = New-Button $tab1 'Restoring DBs...' 1017 166 140
 
 New-Label $tab1 'Restore mode' 10 198 120
-$cboMode = New-Combo $tab1 135 198 300 @('Auto (point in time when logs exist)', 'FULL only', 'FULL + DIFF', 'FULL + DIFF + LOG (point in time)')
+$cboMode = New-Combo $tab1 135 198 300 @('Auto (point in time when logs exist)', 'FULL only', 'FULL + DIFF', 'FULL + DIFF + LOG (point in time)', 'Continue: DIFF only (target already RESTORING)', 'Continue: DIFF + LOGs (point in time)', 'Continue: LOGs only (point in time)')
 New-Label $tab1 'STOPAT (source time)' 450 198 130
 $dtpStop = New-DateTime $tab1 585 198 190 (Get-Date)
 $btnStopNow = New-Button $tab1 'Now' 780 196 50
@@ -1557,20 +1672,25 @@ $chkAutoUnc = New-Check $gLoc 'Convert local paths (C:\...) to the source server
 
 $gMove = New-Group $tab2 'WITH MOVE - edit the TargetPath column if needed' 10 214 1150 120
 New-Label $gMove 'Strategy' 10 22 70
-$cboMove = New-Combo $gMove 85 22 470 @('Auto: similar database -> most-used user-database folder -> instance default', 'Manual: use the folders below', 'Instance default data/log paths')
+$cboMove = New-Combo $gMove 85 22 470 @('Auto: similar database -> most-used user-database folder -> instance default', 'Manual: use the folders below', 'Instance default data/log paths', 'Largest free disk on the destination')
 New-Label $gMove 'Similar DB name contains' 570 22 160
 $txtPattern = New-TextBox $gMove 735 22 250
 $btnRecalc = New-Button $gMove 'Recalculate MOVE' 995 20 140
 New-Label $gMove 'Data (mdf)' 10 52 70
-$txtDataDir = New-TextBox $gMove 85 52 300
-New-Label $gMove 'NDF' 395 52 35
-$txtNdfDir = New-TextBox $gMove 430 52 300
-New-Label $gMove 'Log (ldf)' 740 52 60
-$txtLogDir = New-TextBox $gMove 805 52 330
-New-Label $gMove 'Folders typed here always win over Auto. Leave NDF empty to put NDFs with the MDF.' 10 84 800
+$txtDataDir = New-TextBox $gMove 85 52 262
+$btnBrData = New-Button $gMove '...' 350 51 32 25
+New-Label $gMove 'NDF' 392 52 32
+$txtNdfDir = New-TextBox $gMove 425 52 262
+$btnBrNdf = New-Button $gMove '...' 690 51 32 25
+New-Label $gMove 'Log (ldf)' 732 52 60
+$txtLogDir = New-TextBox $gMove 795 52 300
+$btnBrLog = New-Button $gMove '...' 1098 51 32 25
+$btnSetRows = New-Button $gMove 'Set folder for selected rows...' 10 82 220 27
+New-Label $gMove '... = browse the destination disks (free space, folders). Typed folders win over the strategy. Empty NDF = with the MDF.' 240 84 900
 $gridMove = New-Grid -ReadOnly $false
 [void](Add-Ctl $tab2 $gridMove 10 340 1150 370)
 $gridMove.Anchor = 'Top,Bottom,Left,Right'
+$gridMove.MultiSelect = $true
 
 # ---------- tab 3 ----------
 $gTde = New-Group $tab3 'TDE / backup-encryption certificate (only used by Execute fixes)' 10 8 570 210
@@ -1672,7 +1792,7 @@ function Invoke-Ui {
 }
 
 function Read-Options {
-    $modes = @('Auto', 'FullOnly', 'FullDiff', 'FullDiffLog')
+    $modes = @('Auto', 'FullOnly', 'FullDiff', 'FullDiffLog', 'ContinueDiff', 'ContinueDiffLog', 'ContinueLog')
     $pin = 0
     if ($chkPin.Checked) {
         $row = $gridHist.CurrentRow
@@ -1722,6 +1842,13 @@ function Update-MemLabel {
 
 function Update-MoveGrid {
     $o = $script:Opt
+    if ($script:State.Chain -and $script:State.Chain.Sets[0].Type -ne 'FULL') {
+        $dt = New-Object System.Data.DataTable
+        foreach ($c in 'LogicalName', 'Kind', 'SizeMB', 'SourcePath', 'TargetPath', 'Comment', 'Computed') { [void]$dt.Columns.Add($c) }
+        $script:State.MoveTable = $dt; $gridMove.DataSource = $dt
+        Write-Log 'No FULL in this chain (continue mode): the database files already exist, so no WITH MOVE is needed.' 'INFO'
+        return
+    }
     if (-not $script:State.Dest) { throw 'Destination information is needed for MOVE paths: fill in the destination and run preflight.' }
     $plan = Get-MovePlan -Files $script:State.Files -Dest $script:State.Dest -TargetDb $o.Target -Strategy $o.MoveStrategy `
                          -DataDir $o.DataDir -NdfDir $o.NdfDir -LogDir $o.LogDir -Pattern $o.Pattern
@@ -1830,6 +1957,109 @@ $btnStopNow.Add_Click({ Invoke-Ui {
     Write-Log ('STOPAT set to now: {0:yyyy-MM-dd hh:mm:ss tt} (source server time).' -f $now) 'OK'
 } })
 
+function Show-DestFolderPicker {
+    param([string]$Title, [string]$Start)
+    $conn = $script:Opt.Dest
+    if (-not $conn.Server) { throw 'Enter the destination server first (tab 1).' }
+    Set-Status "Reading disks on $($conn.Server)..."
+    $drives = @(Get-DestDrives $conn)
+    if (-not $drives.Count) { throw "Could not list the disks on $($conn.Server). Needs VIEW SERVER STATE (or sysadmin for xp_fixeddrives)." }
+    $script:PickConn = $conn
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "$Title - disks on $($conn.Server)"; $dlg.Size = New-Object System.Drawing.Size(760, 620); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $form.Font
+    New-Label $dlg 'Disks and folders as the destination SQL Server service account sees them. Expand a disk to see its folders.' 10 8 720
+    $tree = New-Object System.Windows.Forms.TreeView
+    $tree.HideSelection = $false
+    [void](Add-Ctl $dlg $tree 10 34 725 450)
+    $maxFree = ($drives | Measure-Object FreeBytes -Maximum).Maximum
+    $bold = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
+    foreach ($dv in $drives) {
+        $txt = '{0}    {1:N1} GB free' -f $dv.Root, ($dv.FreeBytes / 1GB)
+        if ($dv.TotalBytes) { $txt += ' of {0:N0} GB ({1:N0}% free)' -f ($dv.TotalBytes / 1GB), (100 * $dv.FreeBytes / $dv.TotalBytes) }
+        if ($dv.FreeBytes -eq $maxFree) { $txt += '    <- most free space' }
+        $node = New-Object System.Windows.Forms.TreeNode -ArgumentList $txt
+        $node.Tag = $dv.Root
+        if ($dv.FreeBytes -eq $maxFree) { $node.NodeFont = $bold }
+        [void]$node.Nodes.Add('(loading...)')
+        [void]$tree.Nodes.Add($node)
+    }
+    New-Label $dlg 'Selected folder (you can also type a path; it must already exist on the destination):' 10 492 720
+    $script:PickPath = New-TextBox $dlg 10 516 725 $Start
+    $ok = New-Button $dlg 'Use this folder' 495 548 130
+    $cancel = New-Button $dlg 'Cancel' 635 548 100
+    $ok.DialogResult = 'OK'; $cancel.DialogResult = 'Cancel'; $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+    $tree.Add_BeforeExpand({
+        $n = $_.Node
+        if ($n.Nodes.Count -eq 1 -and $null -eq $n.Nodes[0].Tag -and $n.Nodes[0].Text -eq '(loading...)') {
+            $n.Nodes.Clear()
+            try {
+                $subs = @(Get-DestSubfolders $script:PickConn ([string]$n.Tag))
+                foreach ($sub in $subs) {
+                    $c = New-Object System.Windows.Forms.TreeNode -ArgumentList $sub
+                    $c.Tag = Join-WinPath ([string]$n.Tag) $sub
+                    [void]$c.Nodes.Add('(loading...)')
+                    [void]$n.Nodes.Add($c)
+                }
+                if (-not $subs.Count) { [void]$n.Nodes.Add('(no subfolders, or no access for the SQL service account)') }
+            } catch { [void]$n.Nodes.Add('(cannot list: ' + (Get-SqlErrorText $_) + ')') }
+        }
+    })
+    $tree.Add_AfterSelect({ if ($_.Node.Tag) { $script:PickPath.Text = [string]$_.Node.Tag } })
+    Set-Status 'Ready'
+    $r = $dlg.ShowDialog($form)
+    $path = $script:PickPath.Text.Trim()
+    $dlg.Dispose()
+    if ($r -eq [System.Windows.Forms.DialogResult]::OK -and $path) { return $path }
+    return $null
+}
+
+$btnBrData.Add_Click({ Invoke-Ui { Read-Options; $p = Show-DestFolderPicker 'Folder for the MDF' $txtDataDir.Text; if ($p) { $txtDataDir.Text = $p } } })
+$btnBrNdf.Add_Click({ Invoke-Ui { Read-Options; $p = Show-DestFolderPicker 'Folder for the NDF files' $txtNdfDir.Text; if ($p) { $txtNdfDir.Text = $p } } })
+$btnBrLog.Add_Click({ Invoke-Ui { Read-Options; $p = Show-DestFolderPicker 'Folder for the LDF' $txtLogDir.Text; if ($p) { $txtLogDir.Text = $p } } })
+$btnSetRows.Add_Click({ Invoke-Ui {
+    Read-Options
+    if (-not $script:State.MoveTable -or $script:State.MoveTable.Rows.Count -eq 0) { throw 'No MOVE rows yet: build the chain (with the destination filled in) first.' }
+    $rows = @($gridMove.SelectedRows)
+    if (-not $rows.Count -and $gridMove.CurrentRow) { $rows = @($gridMove.CurrentRow) }
+    if (-not $rows.Count) { throw 'Select one or more rows in the MOVE grid first (click the row; Ctrl/Shift for several).' }
+    $p = Show-DestFolderPicker ("Folder for {0} selected file(s)" -f $rows.Count) ''
+    if (-not $p) { return }
+    foreach ($gr in $rows) {
+        $dr = $gr.DataBoundItem.Row
+        $dr['TargetPath'] = Join-WinPath $p (Get-Leaf ([string]$dr['TargetPath']))
+    }
+    Write-Log "Set folder $p for $($rows.Count) file(s). Run preflight to re-check folders and space." 'OK'
+} })
+
+$cboMode.Add_SelectedIndexChanged({
+    if ($cboMode.SelectedIndex -ge 4) {
+        $script:TargetAuto = $false
+        Write-Log 'Continue mode: set "Restore as" to the database that is already RESTORING on the destination (Restoring DBs... button). The FULL is not restored again.' 'INFO'
+    }
+})
+
+$btnRestoring.Add_Click({ Invoke-Ui {
+    Read-Options
+    if (-not $script:Opt.Dest.Server) { throw 'Enter the destination server first.' }
+    $t = Invoke-Sql $script:Opt.Dest @"
+SELECT d.name,
+       (SELECT TOP (1) CONVERT(varchar(19), rh.restore_date, 120) + ' ' +
+               CASE rh.restore_type WHEN 'D' THEN 'FULL' WHEN 'I' THEN 'DIFF' WHEN 'L' THEN 'LOG' ELSE rh.restore_type END
+        FROM msdb.dbo.restorehistory rh WHERE rh.destination_database_name = d.name ORDER BY rh.restore_history_id DESC) AS last_restore
+FROM sys.databases d WHERE d.state_desc = N'RESTORING' ORDER BY d.name;
+"@
+    if (-not $t.Rows.Count) { Show-Info "No database is in RESTORING state on $($script:Opt.Dest.Server)."; return }
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    foreach ($r in $t.Rows) {
+        $label = [string]$r.name
+        if ($r.last_restore -isnot [System.DBNull]) { $label += '    (last restore: ' + [string]$r.last_restore + ')' }
+        $it = $menu.Items.Add($label)
+        $it.Tag = [string]$r.name
+        $it.Add_Click({ $txtTarget.Text = [string]$this.Tag; $script:TargetAuto = $false; Write-Log "Target set to RESTORING database [$($this.Tag)]." 'OK' })
+    }
+    $menu.Show($btnRestoring, (New-Object System.Drawing.Point(0, $btnRestoring.Height)))
+} })
+
 $btnUseFinish.Add_Click({
     $row = $gridHist.CurrentRow
     if ($row) { $dtpStop.Value = [datetime]$row.Cells['Finish'].Value } else { Show-Info 'Select a row in the history grid first.' }
@@ -1850,8 +2080,23 @@ $btnBuild.Add_Click({ Invoke-Ui {
     if ($si.FilterNote) { Write-Log $si.FilterNote 'WARN' }
     Write-Log ('STOPAT used: {0:yyyy-MM-dd hh:mm:ss tt} ({0:yyyy-MM-dd HH:mm:ss} 24h), source server time now {1:yyyy-MM-dd hh:mm:ss tt}.' -f $script:Opt.StopAt, $si.ServerTime) 'INFO'
     if ($script:Opt.StopAt -gt $si.ServerTime) { Write-Log 'STOPAT is in the future on the source server: the chain will need a log backup that does not exist yet. Use the Now button or an earlier time.' 'WARN' }
+    $redo = $null; $dbase = $null
+    if ($script:Opt.Mode -like 'Continue*') {
+        Assert-Dest
+        $script:State.Dest = Get-DestInfo $script:Opt.Dest $script:Opt.Target
+        $dd = $script:State.Dest
+        if (-not $dd.TargetExists -or $dd.TargetState -ne 'RESTORING') {
+            $names = @((Invoke-Sql $script:Opt.Dest "SELECT name FROM sys.databases WHERE state_desc = N'RESTORING' ORDER BY name;").Rows | ForEach-Object { [string]$_.name })
+            $st = 'does not exist'; if ($dd.TargetExists) { $st = "is $($dd.TargetState)" }
+            $lst = 'none'; if ($names.Count) { $lst = $names -join ', ' }
+            throw "Continue mode: [$($script:Opt.Target)] $st on $($dd.ServerName); it must be RESTORING. RESTORING databases there: $lst."
+        }
+        if (-not $dd.TargetRedoLsn) { throw "Could not read redo_start_lsn for [$($script:Opt.Target)] on $($dd.ServerName) (needs VIEW SERVER STATE / VIEW ANY DEFINITION)." }
+        $redo = $dd.TargetRedoLsn; $dbase = $dd.TargetDiffBaseLsn
+        Write-Log "Continuing [$($script:Opt.Target)] on $($dd.ServerName): RESTORING, next restore starts at LSN $redo (differential base LSN $dbase). Last restore: $($dd.TargetLastRestore)" 'INFO'
+    }
     $chain = Get-BackupChain -Conn $script:Opt.Src -Db $script:Opt.Db -StopAt $script:Opt.StopAt -Mode $script:Opt.Mode `
-                             -PinnedFullId $script:Opt.PinnedFullId -SrcMajor $si.Major -ServerFilter $si.ServerFilter
+                             -PinnedFullId $script:Opt.PinnedFullId -SrcMajor $si.Major -ServerFilter $si.ServerFilter -ContinueLsn $redo -DiffBaseLsn $dbase
     $script:State.Chain = $chain
     $script:State.Checks = $null; $script:State.MoveTable = $null; $gridChecks.DataSource = $null
     foreach ($w in $chain.Warnings) { Write-Log $w 'WARN' }
@@ -1861,7 +2106,7 @@ $btnBuild.Add_Click({ Invoke-Ui {
     Set-Status 'Checking whether local backup folders are shared...'
     Update-ShareMap
     $gridChain.DataSource = ConvertTo-DataTable $chain.Sets @('Step', 'Type', 'Id', 'IsCopyOnly', 'Start', 'Finish', 'FirstLsn', 'LastLsn', 'SizeMB', 'Files')
-    Write-Log ("Chain built (mode {0}): {1}. FULL id {2} finished {3:yyyy-MM-dd hh:mm:ss tt}. Restore point {4:yyyy-MM-dd hh:mm:ss tt}." -f $chain.Mode, (Get-ChainSummary $chain), $chain.Sets[0].Id, $chain.Sets[0].Finish, $chain.RestorePoint) 'OK'
+    Write-Log ("Chain built (mode {0}): {1}. First: {2} id {3} finished {4:yyyy-MM-dd hh:mm:ss tt}. Restore point {5:yyyy-MM-dd hh:mm:ss tt}." -f $chain.Mode, (Get-ChainSummary $chain), $chain.Sets[0].Type, $chain.Sets[0].Id, $chain.Sets[0].Finish, $chain.RestorePoint) 'OK'
     if ($script:Opt.Dest.Server -and $script:Opt.Target) {
         try { $script:State.Dest = Get-DestInfo $script:Opt.Dest $script:Opt.Target; Add-RecentServer $script:Opt.Dest.Server $script:Opt.Dest.Auth $script:Opt.Dest.User; Update-MoveGrid }
         catch { Write-Log "Destination not read yet: $(Get-SqlErrorText $_)" 'WARN' }
