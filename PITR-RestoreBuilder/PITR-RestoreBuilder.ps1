@@ -32,7 +32,7 @@
 
 $ErrorActionPreference = 'Stop'
 $script:AppName = 'PITR Restore Builder'
-$script:Version = '1.7'
+$script:Version = '1.8'
 
 #region ============================ general helpers ============================
 
@@ -402,6 +402,45 @@ ORDER BY bs.first_lsn, bs.backup_finish_date;
     }
 }
 
+# Which FULL/DIFF is a running RESTORE using? 1) backup_set_id in this tool's step comments, 2) file names
+function Find-RunningBackupSet {
+    param([hashtable]$Conn, [string]$Db, [int]$SrcMajor, [string]$ServerFilter, [string]$Text)
+    if (-not $Text) { return $null }
+    $m = [regex]::Matches($Text, 'backup_set_id=(\d+)')
+    foreach ($x in $m) {
+        $q = (Get-BsSelect $SrcMajor '' $ServerFilter) + " AND bs.type IN ('D', 'I') AND bs.backup_set_id = @id;"
+        $rows = Invoke-Sql $Conn $q @{ db = $Db; id = [int]$x.Groups[1].Value }
+        if ($rows.Rows.Count) { return (ConvertTo-BackupSet $rows.Rows[0]) }
+    }
+    $leaves = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($x in [regex]::Matches($Text, "(?i)\b(?:URL|DISK)\s*=\s*N?'([^']+)'")) { [void]$leaves.Add((Get-Leaf $x.Groups[1].Value)) }
+    if ($leaves.Count -eq 0) { return $null }
+    $q = (Get-BsSelect $SrcMajor 'TOP (500)' $ServerFilter) + " AND bs.type IN ('D', 'I') ORDER BY bs.backup_finish_date DESC;"
+    foreach ($r in (Invoke-Sql $Conn $q @{ db = $Db }).Rows) {
+        $bs = ConvertTo-BackupSet $r
+        foreach ($dev in $bs.Devices) { if ($leaves.Contains((Get-Leaf $dev.Path))) { return $bs } }
+    }
+    return $null
+}
+
+# T-SQL that waits while another session is restoring the target database (continue mode)
+function New-WaitForRestoreSql {
+    param([string]$Target, [int]$MaxMinutes = 2880)
+    $waitMsg = ('Waiting for the restore already running on [{0}] to finish (%d min so far)...' -f $Target.Replace('%', '%%'))
+    $giveUp = ('Gave up after {0} minutes waiting for the running restore of [{1}].' -f $MaxMinutes, $Target).Replace('%', '%%')
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('DECLARE @waitMin int = 0;')
+    [void]$sb.AppendLine('WHILE EXISTS (SELECT 1 FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t')
+    [void]$sb.AppendLine("              WHERE r.command LIKE N'RESTORE%' AND r.session_id <> @@SPID AND CHARINDEX($(QS $Target), t.text) > 0)")
+    [void]$sb.AppendLine('BEGIN')
+    [void]$sb.AppendLine("    IF @waitMin % 15 = 0 RAISERROR($(QS $waitMsg), 0, 1, @waitMin) WITH NOWAIT;")
+    [void]$sb.AppendLine("    WAITFOR DELAY '00:01:00';")
+    [void]$sb.AppendLine('    SET @waitMin = @waitMin + 1;')
+    [void]$sb.AppendLine("    IF @waitMin >= $MaxMinutes BEGIN RAISERROR($(QS $giveUp), 16, 1); RETURN; END")
+    [void]$sb.AppendLine('END')
+    return $sb.ToString()
+}
+
 function Get-ChainSummary {
     param($Chain)
     $parts = foreach ($t in 'FULL', 'DIFF', 'LOG') { $k = @($Chain.Sets | Where-Object { $_.Type -eq $t }).Count; if ($k) { "$k $t" } }
@@ -460,6 +499,7 @@ SELECT @@SERVERNAME AS ServerName, SYSDATETIME() AS ServerTime,
         TargetExists = $false; TargetState = $null; TargetInAg = $false
         Certs = @(); HasDmk = $false; Credentials = @(); UserFiles = @(); Volumes = @(); FixedDrives = @(); Drives = @()
         TargetRedoLsn = $null; TargetDiffBaseLsn = $null; TargetLastRestore = $null
+        RestoreRunning = $false; RunningPct = $null; RunningEtaMin = $null; RunningSession = $null; RunningStart = $null; RunningText = $null
     }
     try {
         foreach ($s in (Invoke-Sql $Conn 'SELECT servicename, service_account, status_desc FROM sys.dm_server_services;').Rows) {
@@ -482,6 +522,20 @@ SELECT @@SERVERNAME AS ServerName, SYSDATETIME() AS ServerTime,
             try {
                 $rl = Invoke-Sql $Conn 'SELECT redo_start_lsn, differential_base_lsn FROM sys.master_files WHERE database_id = DB_ID(@t) AND file_id = 1;' @{ t = $Target }
                 if ($rl.Rows.Count) { $d.TargetRedoLsn = DbVal $rl.Rows[0].redo_start_lsn; $d.TargetDiffBaseLsn = DbVal $rl.Rows[0].differential_base_lsn }
+            } catch { }
+            try {
+                $rr = Invoke-Sql $Conn @"
+SELECT TOP (1) r.session_id, r.command, r.percent_complete, r.estimated_completion_time, r.start_time, t.text
+FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.command LIKE N'RESTORE%' AND r.session_id <> @@SPID AND CHARINDEX(@t, t.text) > 0
+ORDER BY r.start_time;
+"@ @{ t = $Target }
+                if ($rr.Rows.Count) {
+                    $x = $rr.Rows[0]
+                    $d.RestoreRunning = $true; $d.RunningSession = [int]$x.session_id; $d.RunningStart = [datetime]$x.start_time
+                    $d.RunningPct = [double](DbVal0 $x.percent_complete); $d.RunningEtaMin = [double](DbVal0 $x.estimated_completion_time) / 60000
+                    $d.RunningText = [string]$x.text
+                }
             } catch { }
             try {
                 $lr = Invoke-Sql $Conn @"
@@ -853,6 +907,7 @@ function Invoke-Preflight {
     if ($c.Mode -like 'Continue*') {
         if (-not $d.TargetExists) { Add-Check 'FAIL' 'Target database' "[$($o.Target)] does not exist on the destination. Continue modes need a database that is already RESTORING." 'Use the Restoring DBs button on tab 1, or restore a FULL first.' }
         elseif ($d.TargetState -ne 'RESTORING') { Add-Check 'FAIL' 'Target database' "[$($o.Target)] is $($d.TargetState), not RESTORING, so no DIFF or LOG can be applied." 'It was recovered already. Start again with a FULL (WITH REPLACE or a new name).' }
+        elseif ($d.RestoreRunning) { Add-Check 'WARN' 'Target database' ("[{0}] is RESTORING and a restore is still running ({1:N1}% done, ~{2:N0} min left). The generated script/job waits for it to finish first." -f $o.Target, $d.RunningPct, $d.RunningEtaMin) }
         else { Add-Check 'PASS' 'Target database' "[$($o.Target)] is RESTORING; next restore starts at LSN $($d.TargetRedoLsn). Last restore: $($d.TargetLastRestore)" }
     }
     elseif ($d.TargetExists) {
@@ -977,6 +1032,31 @@ function Invoke-Preflight {
         Add-Check 'WARN' 'Files added after the FULL' "Files created after the FULL: $($script:State.AddedLater -join ', '). The log restore recreates them at their ORIGINAL path; add MOVE for them on that step if the path is invalid on the destination."
     }
     if ($d.AgentStatus -and $d.AgentStatus -ne 'Running') { Add-Check 'WARN' 'SQL Agent' "SQL Server Agent is $($d.AgentStatus) on the destination: a scheduled job would not run." }
+    if ($o.NotifyEmail -or $o.NotifyOperator) {
+        try {
+            $mx = Invoke-Sql $o.Dest @"
+SELECT (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'Database Mail XPs') AS xps,
+       (SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS profiles,
+       (SELECT TOP (1) p.name FROM msdb.dbo.sysmail_profile p
+          LEFT JOIN msdb.dbo.sysmail_principalprofile pp ON pp.profile_id = p.profile_id AND pp.is_default = 1
+          ORDER BY CASE WHEN pp.profile_id IS NULL THEN 1 ELSE 0 END, p.profile_id) AS pick;
+"@
+            $x = $mx.Rows[0]
+            if ([int](DbVal0 $x.xps) -ne 1) { Add-Check 'WARN' 'Database Mail' 'Database Mail XPs is disabled on the destination: no e-mail can be sent.' "sp_configure 'Database Mail XPs', 1; RECONFIGURE; then set up a profile." }
+            elseif ([int](DbVal0 $x.profiles) -eq 0) { Add-Check 'WARN' 'Database Mail' 'No Database Mail profile exists on the destination: the job will run but cannot send e-mail.' 'Create a Database Mail profile (SSMS > Management > Database Mail).' }
+            else { Add-Check 'PASS' 'Database Mail' "Enabled; the job would use profile [$($x.pick)] (default profile, else the first)." }
+        } catch { Add-Check 'WARN' 'Database Mail' "Could not check Database Mail: $(Get-SqlErrorText $_)" }
+        if ($o.NotifyOperator) {
+            try {
+                $op = Invoke-Sql $o.Dest 'SELECT enabled, email_address FROM msdb.dbo.sysoperators WHERE name = @n;' @{ n = $o.NotifyOperator }
+                if (-not $op.Rows.Count) { Add-Check 'FAIL' 'Operator' "SQL Agent operator [$($o.NotifyOperator)] does not exist on the destination; sp_add_job would fail." 'Pick one with Load operators, or clear it.' }
+                elseif ([int]$op.Rows[0].enabled -ne 1 -or -not ([string](DbVal $op.Rows[0].email_address))) { Add-Check 'WARN' 'Operator' "Operator [$($o.NotifyOperator)] is disabled or has no e-mail address." }
+                else { Add-Check 'PASS' 'Operator' "[$($o.NotifyOperator)] -> $($op.Rows[0].email_address)" }
+                $ap = Invoke-Sql $o.Dest "DECLARE @v nvarchar(255); EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', N'DatabaseMailProfile', @v OUTPUT; SELECT @v AS p;"
+                if (-not [string](DbVal $ap.Rows[0].p)) { Add-Check 'WARN' 'Operator' 'SQL Agent has no mail profile set, so operator notifications will not be sent.' 'SQL Agent > Properties > Alert System > Enable mail profile, then restart SQL Agent.' }
+            } catch { Add-Check 'WARN' 'Operator' "Could not fully check the operator/Agent mail setup: $(Get-SqlErrorText $_)" }
+        }
+    }
 
     $f = @($script:State.Checks | Where-Object Status -eq 'FAIL').Count
     $w = @($script:State.Checks | Where-Object Status -eq 'WARN').Count
@@ -1082,6 +1162,9 @@ function New-SsmsScript {
     [void]$sb.AppendLine("IF @@SERVERNAME <> $(QS $d.ServerName) BEGIN RAISERROR($(QS $srvMsg), 16, 1, @@SERVERNAME) WITH NOWAIT; SET NOEXEC ON; END")
     [void]$sb.AppendLine('GO')
     if ($script:State.Chain.Mode -like 'Continue*') {
+        [void]$sb.AppendLine('-- Continue mode: wait (up to 48 h) while another session is still restoring this database, e.g. the FULL job.')
+        [void]$sb.Append((New-WaitForRestoreSql $o.Target))
+        [void]$sb.AppendLine('GO')
         $m = ("STOP: database [{0}] is not in RESTORING state, so DIFF/LOG restores cannot continue." -f $o.Target).Replace('%', '%%')
         [void]$sb.AppendLine("IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = $(QS $o.Target) AND state_desc = N'RESTORING') BEGIN RAISERROR($(QS $m), 16, 1) WITH NOWAIT; SET NOEXEC ON; END")
         [void]$sb.AppendLine('GO')
@@ -1128,6 +1211,7 @@ function New-JobScript {
     $srvMsg = ("Wrong server %s - this job was generated for {0}." -f $d.ServerName).Replace('%s', '#S#').Replace('%', '%%').Replace('#S#', '%s')
     [void]$guard.AppendLine("IF @@SERVERNAME <> $(QS $d.ServerName) BEGIN RAISERROR($(QS $srvMsg), 16, 1, @@SERVERNAME); RETURN; END")
     if ($script:State.Chain.Mode -like 'Continue*') {
+        [void]$guard.Append((New-WaitForRestoreSql $o.Target))
         $m = ("Database [{0}] is not RESTORING - job stopped (continue mode)." -f $o.Target).Replace('%', '%%')
         [void]$guard.AppendLine("IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = $(QS $o.Target) AND state_desc = N'RESTORING') BEGIN RAISERROR($(QS $m), 16, 1); RETURN; END")
     } elseif (-not $o.Replace) {
@@ -1167,28 +1251,78 @@ function New-JobScript {
     }
     if ($o.WithRecovery) { $stepNo++; $steps.Add([pscustomobject]@{ Name = ('{0:00} WITH RECOVERY' -f $stepNo); Cmd = "RESTORE DATABASE $(QN $o.Target) WITH RECOVERY;" }) }
 
+    # ---- optional e-mail steps (Database Mail; profile chosen when the job runs) ----
+    $restoreSteps = $steps.Count
+    $okStepId = 0; $failStepId = 0
+    $finalState = 'NORECOVERY (database left RESTORING)'
+    if ($o.WithRecovery) { $finalState = 'RECOVERY (database ONLINE)' }
+    $what = "Restore of [$($o.Db)] from $($script:State.Source.ServerName) as [$($o.Target)], mode $($script:State.Chain.Mode), STOPAT $($script:State.Chain.StopAt.ToString('yyyy-MM-dd hh:mm:ss tt')), final state $finalState."
+    if ($o.NotifyEmail -and $o.NotifyOnSuccess) {
+        $okStepId = $steps.Count + 1
+        $ok = New-Object System.Text.StringBuilder
+        [void]$ok.AppendLine('SET NOCOUNT ON;')
+        [void]$ok.Append((New-MailProfileSql))
+        [void]$ok.AppendLine("DECLARE @subject nvarchar(255) = N'[PITR] SUCCEEDED: ' + $(QS $JobName) + N' on ' + @@SERVERNAME;")
+        [void]$ok.AppendLine("DECLARE @body nvarchar(max) = N'SQL Agent job ' + $(QS $JobName) + N' finished successfully on ' + @@SERVERNAME + N' at ' + CONVERT(nvarchar(19), GETDATE(), 120) + N'.' + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10) + $(QS $what);")
+        [void]$ok.Append((New-SendMailSql $o.NotifyEmail))
+        $steps.Add([pscustomobject]@{ Name = 'Notify: succeeded'; Cmd = $ok.ToString(); Kind = 'OK' })
+    }
+    if ($o.NotifyEmail -and $o.NotifyOnFailure) {
+        $failStepId = $steps.Count + 1
+        $fl = New-Object System.Text.StringBuilder
+        [void]$fl.AppendLine('SET NOCOUNT ON;')
+        [void]$fl.Append((New-MailProfileSql))
+        [void]$fl.AppendLine("DECLARE @failed nvarchar(max) = N'(no step history found)';")
+        [void]$fl.AppendLine("SELECT TOP (1) @failed = N'Step ' + CAST(h.step_id AS nvarchar(10)) + N' (' + h.step_name + N'): ' + h.message")
+        [void]$fl.AppendLine("FROM msdb.dbo.sysjobhistory h JOIN msdb.dbo.sysjobs j ON j.job_id = h.job_id")
+        [void]$fl.AppendLine("WHERE j.name = $(QS $JobName) AND h.step_id > 0 ORDER BY h.instance_id DESC;")
+        [void]$fl.AppendLine("DECLARE @subject nvarchar(255) = N'[PITR] FAILED: ' + $(QS $JobName) + N' on ' + @@SERVERNAME;")
+        [void]$fl.AppendLine("DECLARE @body nvarchar(max) = N'SQL Agent job ' + $(QS $JobName) + N' FAILED on ' + @@SERVERNAME + N' at ' + CONVERT(nvarchar(19), GETDATE(), 120) + N'.' + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10) + @failed + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10) + $(QS $what) + CHAR(13) + CHAR(10) + N'The OS-level detail of a RESTORE error is in the SQL Server error log.';")
+        [void]$fl.Append((New-SendMailSql $o.NotifyEmail))
+        [void]$fl.AppendLine('DECLARE @short nvarchar(2000) = LEFT(@failed, 2000);')
+        [void]$fl.AppendLine("RAISERROR(N'PITR restore job failed - %s', 16, 1, @short);")
+        $steps.Add([pscustomobject]@{ Name = 'Notify: failed'; Cmd = $fl.ToString(); Kind = 'FAIL' })
+    }
+    $level = 0
+    if ($o.NotifyOperator) {
+        if ($o.NotifyOnSuccess) { $level += 1 }
+        if ($o.NotifyOnFailure) { $level += 2 }
+    }
+
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine((New-Banner "SQL AGENT JOB '$JobName' (run on the DESTINATION)"))
     if ($o.NoSchedule) { [void]$sb.AppendLine('-- No schedule: start it with sp_start_job (bottom of this script).') }
     else { [void]$sb.AppendLine("-- One-time schedule: $($o.JobRunAt.ToString('yyyy-MM-dd HH:mm:ss')) DESTINATION server local time.") }
     [void]$sb.AppendLine('-- One job step per backup type (FULL / DIFF / all LOGs). Inside a step the restores run in order and stop at the first failure,')
     [void]$sb.AppendLine('-- reporting which backup failed. A failed step quits the job.')
+    if ($o.NotifyEmail) { [void]$sb.AppendLine("-- E-mail ($(if ($o.NotifyOnSuccess) { 'success ' })$(if ($o.NotifyOnFailure) { 'failure' })) to $($o.NotifyEmail) via Database Mail; profile = default profile, else the first one, picked when the job runs.") }
+    if ($level -gt 0) { [void]$sb.AppendLine("-- SQL Agent operator [$($o.NotifyOperator)] notified on $(@{1='success';2='failure';3='success and failure'}[$level]) (needs a mail profile in SQL Agent > Properties > Alert System).") }
     [void]$sb.AppendLine('SET NOCOUNT ON;')
     [void]$sb.AppendLine("DECLARE @jobName sysname = $(QS $JobName), @jobId uniqueidentifier, @owner sysname = SUSER_SNAME(0x01);  -- sa, even if renamed")
     [void]$sb.AppendLine("IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = @jobName) BEGIN RAISERROR(N'Job %s already exists - nothing created.', 16, 1, @jobName); RETURN; END")
     [void]$sb.AppendLine('BEGIN TRY')
     [void]$sb.AppendLine('    BEGIN TRANSACTION;')
     $desc = "PITR restore of [$($o.Db)] from $($script:State.Source.ServerName) as [$($o.Target)], mode $($script:State.Chain.Mode), STOPAT $($script:State.Chain.StopAt.ToString('yyyy-MM-dd HH:mm:ss')). Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by $env:USERDOMAIN\$env:USERNAME."
-    [void]$sb.AppendLine("    EXEC msdb.dbo.sp_add_job @job_name = @jobName, @enabled = 1, @owner_login_name = @owner, @description = $(QS $desc), @job_id = @jobId OUTPUT;")
+    $notify = ''
+    if ($level -gt 0) { $notify = ", @notify_level_email = $level, @notify_email_operator_name = $(QS $o.NotifyOperator)" }
+    [void]$sb.AppendLine("    EXEC msdb.dbo.sp_add_job @job_name = @jobName, @enabled = 1, @owner_login_name = @owner, @description = $(QS $desc)$notify, @job_id = @jobId OUTPUT;")
     $k = 0
     foreach ($st in $steps) {
         $k++
-        $succ = if ($k -lt $steps.Count) { 3 } else { 1 }
-        $flags = if ($k -eq 1) { 0 } else { 2 }
-        $of = if ($outFile) { ", @output_file_name = $(QS $outFile), @flags = $flags" } else { '' }
+        $flags = 2; if ($k -eq 1) { $flags = 0 }
+        $of = ''; if ($outFile) { $of = ", @output_file_name = $(QS $outFile), @flags = $flags" }
         $nm = $st.Name; if ($nm.Length -gt 128) { $nm = $nm.Substring(0, 128) }
+        # actions: 1 = quit success, 2 = quit failure, 3 = next step, 4 = go to step
+        if ($k -le $restoreSteps) {
+            if ($k -lt $restoreSteps) { $succ = '3' }
+            elseif ($okStepId) { $succ = "4, @on_success_step_id = $okStepId" }
+            else { $succ = '1' }
+            if ($failStepId) { $fail = "4, @on_fail_step_id = $failStepId" } else { $fail = '2' }
+        }
+        elseif ($st.Kind -eq 'OK') { $succ = '1'; $fail = '1' }      # a mail problem must not turn a good restore into a failed job
+        else { $succ = '2'; $fail = '2' }                              # failure-notify step always ends the job as FAILED
         [void]$sb.AppendLine("    EXEC msdb.dbo.sp_add_jobstep @job_id = @jobId, @step_id = $k, @step_name = $(QS $nm), @subsystem = N'TSQL', @database_name = N'master',")
-        [void]$sb.AppendLine("         @on_success_action = $succ, @on_fail_action = 2, @retry_attempts = 0$of,")
+        [void]$sb.AppendLine("         @on_success_action = $succ, @on_fail_action = $fail, @retry_attempts = 0$of,")
         [void]$sb.AppendLine("         @command = $(QS $st.Cmd);")
     }
     if (-not $o.NoSchedule) {
@@ -1208,6 +1342,30 @@ function New-JobScript {
     [void]$sb.AppendLine("-- To start it now instead of waiting for the schedule:")
     [void]$sb.AppendLine("-- EXEC msdb.dbo.sp_start_job @job_name = $(QS $JobName);")
     if ($outFile) { [void]$sb.AppendLine("-- Step output is appended to: $outFile") }
+    return $sb.ToString()
+}
+
+# Picks the Database Mail profile when the job runs: the default (public/private) profile, else the first one
+function New-MailProfileSql {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('DECLARE @profile sysname;')
+    [void]$sb.AppendLine('SELECT TOP (1) @profile = p.name FROM msdb.dbo.sysmail_profile p')
+    [void]$sb.AppendLine('LEFT JOIN msdb.dbo.sysmail_principalprofile pp ON pp.profile_id = p.profile_id AND pp.is_default = 1')
+    [void]$sb.AppendLine('ORDER BY CASE WHEN pp.profile_id IS NULL THEN 1 ELSE 0 END, p.profile_id;')
+    return $sb.ToString()
+}
+
+function New-SendMailSql {
+    param([string]$Recipients)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('BEGIN TRY')
+    [void]$sb.AppendLine("    IF @profile IS NULL BEGIN RAISERROR(N'No Database Mail profile exists on this server - notification e-mail not sent.', 10, 1) WITH NOWAIT; END")
+    [void]$sb.AppendLine("    ELSE BEGIN EXEC msdb.dbo.sp_send_dbmail @profile_name = @profile, @recipients = $(QS $Recipients), @subject = @subject, @body = @body; END")
+    [void]$sb.AppendLine('END TRY')
+    [void]$sb.AppendLine('BEGIN CATCH')
+    [void]$sb.AppendLine("    DECLARE @mailErr nvarchar(2000) = LEFT(ERROR_MESSAGE(), 2000);")
+    [void]$sb.AppendLine("    RAISERROR(N'Notification e-mail could not be sent: %s', 10, 1, @mailErr) WITH NOWAIT;")
+    [void]$sb.AppendLine('END CATCH')
     return $sb.ToString()
 }
 
@@ -1721,7 +1879,19 @@ New-Label $gOut 'Output folder' 10 24 100
 $txtOut = New-TextBox $gOut 115 24 900 (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PITR_Restore')
 $btnBrowse = New-Button $gOut 'Browse...' 1025 22 110
 
-$gExec = New-Group $tab3 'Execution (everything above is generate-only)' 10 290 1150 130
+$gNotify = New-Group $tab3 'Job notifications (remembered on this PC)' 10 290 1150 92
+New-Label $gNotify 'E-mail to' 10 24 70
+$txtNotifyEmail = New-TextBox $gNotify 85 24 430
+New-Label $gNotify 'a@x.com;b@x.com - sent by the job through Database Mail (default profile, else the first, picked at run time)' 525 24 615
+New-Label $gNotify 'Operator' 10 56 70
+$cboOperator = New-Combo $gNotify 85 56 260 @('(none)') -Editable
+$cboOperator.Text = '(none)'
+$btnLoadOps = New-Button $gNotify 'Load operators' 352 54 120
+$chkNotifyOk = New-Check $gNotify 'On success' 490 56 100 $true
+$chkNotifyFail = New-Check $gNotify 'On failure' 595 56 100 $true
+New-Label $gNotify 'Operator mail uses SQL Agent''s mail profile (Agent > Properties > Alert System).' 700 56 440
+
+$gExec = New-Group $tab3 'Execution (everything above is generate-only)' 10 388 1150 130
 $chkAllow = New-Check $gExec 'Allow execution (OFF = read-only)' 10 24 400
 $chkAllow.ForeColor = [System.Drawing.Color]::DarkRed
 $btnExecFixes = New-Button $gExec 'Execute fixes (azcopy / credential / TDE)...' 10 56 330 30
@@ -1814,6 +1984,8 @@ function Read-Options {
         CertPwd = $txtCertPwd.Text; CertPwd2 = $txtCertPwd2.Text; DmkPwd = $txtDmkPwd.Text
         StageRoot = $txtStage.Text.Trim(); DestCertDir = $txtDestCert.Text.Trim().TrimEnd('\')
         JobName = $txtJob.Text.Trim(); JobRunAt = $dtpJob.Value; NoSchedule = $chkNoSched.Checked; StartNow = $chkStartNow.Checked
+        NotifyEmail = $txtNotifyEmail.Text.Trim().Trim(';'); NotifyOperator = $(if ($cboOperator.Text.Trim() -eq '(none)') { '' } else { $cboOperator.Text.Trim() })
+        NotifyOnSuccess = $chkNotifyOk.Checked; NotifyOnFailure = $chkNotifyFail.Checked
         OutRoot = $txtOut.Text.Trim(); AllowExec = $chkAllow.Checked; AutoUnc = $chkAutoUnc.Checked
     }
     if ($script:Opt.BlobMode -and -not $script:Opt.ContainerUrl) { Write-Log "Blob option is ticked but the container URL is a placeholder; scripts will contain <account>/<container>." 'WARN' }
@@ -2038,6 +2210,18 @@ $cboMode.Add_SelectedIndexChanged({
     }
 })
 
+$btnLoadOps.Add_Click({ Invoke-Ui {
+    Read-Options
+    if (-not $script:Opt.Dest.Server) { throw 'Enter the destination server first (tab 1).' }
+    $t = Invoke-Sql $script:Opt.Dest 'SELECT name, email_address FROM msdb.dbo.sysoperators WHERE enabled = 1 ORDER BY name;' -Database 'msdb'
+    $keep = $cboOperator.Text
+    $cboOperator.Items.Clear(); [void]$cboOperator.Items.Add('(none)')
+    foreach ($r in $t.Rows) { [void]$cboOperator.Items.Add([string]$r.name) }
+    $cboOperator.Text = $keep
+    if ($t.Rows.Count) { $cboOperator.DroppedDown = $true }
+    Write-Log ("{0} enabled operator(s) on {1}: {2}" -f $t.Rows.Count, $script:Opt.Dest.Server, ((@($t.Rows) | ForEach-Object { "$($_.name) <$($_.email_address)>" }) -join '; ')) 'OK'
+} })
+
 $btnRestoring.Add_Click({ Invoke-Ui {
     Read-Options
     if (-not $script:Opt.Dest.Server) { throw 'Enter the destination server first.' }
@@ -2091,9 +2275,21 @@ $btnBuild.Add_Click({ Invoke-Ui {
             $lst = 'none'; if ($names.Count) { $lst = $names -join ', ' }
             throw "Continue mode: [$($script:Opt.Target)] $st on $($dd.ServerName); it must be RESTORING. RESTORING databases there: $lst."
         }
-        if (-not $dd.TargetRedoLsn) { throw "Could not read redo_start_lsn for [$($script:Opt.Target)] on $($dd.ServerName) (needs VIEW SERVER STATE / VIEW ANY DEFINITION)." }
-        $redo = $dd.TargetRedoLsn; $dbase = $dd.TargetDiffBaseLsn
-        Write-Log "Continuing [$($script:Opt.Target)] on $($dd.ServerName): RESTORING, next restore starts at LSN $redo (differential base LSN $dbase). Last restore: $($dd.TargetLastRestore)" 'INFO'
+        if ($dd.TargetRedoLsn) {
+            $redo = $dd.TargetRedoLsn; $dbase = $dd.TargetDiffBaseLsn
+            Write-Log "Continuing [$($script:Opt.Target)] on $($dd.ServerName): RESTORING, next restore starts at LSN $redo (differential base LSN $dbase). Last restore: $($dd.TargetLastRestore)" 'INFO'
+        }
+        elseif ($dd.RestoreRunning) {
+            Write-Log ("A RESTORE is still running on [{0}]: session {1}, {2:N1}% done, about {3:N0} min left (started {4:yyyy-MM-dd hh:mm tt}). SQL Server only records the next-restore LSN when it finishes." -f $script:Opt.Target, $dd.RunningSession, $dd.RunningPct, $dd.RunningEtaMin, $dd.RunningStart) 'WARN'
+            $rs = Find-RunningBackupSet $script:Opt.Src $script:Opt.Db $si.Major $si.ServerFilter $dd.RunningText
+            if (-not $rs) { throw ("A RESTORE is still running on [{0}] ({1:N1}% done, ~{2:N0} min left) and the tool could not match it to a FULL/DIFF of [{3}] in the source msdb. Wait until it finishes, then Build chain again." -f $script:Opt.Target, $dd.RunningPct, $dd.RunningEtaMin, $script:Opt.Db) }
+            $redo = $rs.LastLsn
+            if ($rs.Type -eq 'FULL') { $dbase = $rs.CheckpointLsn } else { $dbase = $rs.DatabaseBackupLsn }
+            Write-Log ("Planning from the backup being restored now: {0} id {1}, finished {2:yyyy-MM-dd hh:mm:ss tt} (LSN {3} -> {4}). The DIFF/LOG job will WAIT for that restore to finish before it starts." -f $rs.Type, $rs.Id, $rs.Finish, $rs.FirstLsn, $rs.LastLsn) 'OK'
+        }
+        else {
+            throw ("[{0}] is RESTORING but its next-restore LSN (redo_start_lsn) is empty and no running RESTORE is visible. If a restore is running, your login needs VIEW SERVER STATE on {1} to see it. Otherwise a restore may have failed part-way: restore the FULL again." -f $script:Opt.Target, $dd.ServerName)
+        }
     }
     $chain = Get-BackupChain -Conn $script:Opt.Src -Db $script:Opt.Db -StopAt $script:Opt.StopAt -Mode $script:Opt.Mode `
                              -PinnedFullId $script:Opt.PinnedFullId -SrcMajor $si.Major -ServerFilter $si.ServerFilter -ContinueLsn $redo -DiffBaseLsn $dbase
@@ -2195,6 +2391,7 @@ $btnCreateJob.Add_Click({ Invoke-Ui {
     if ($script:Opt.Db -ne $g.Db) { $changed += "source database ($($g.Db) -> $($script:Opt.Db))" }
     if ($script:Opt.StopAt -ne $g.StopAt) { $changed += "STOPAT ($($g.StopAt.ToString('yyyy-MM-dd hh:mm:ss tt')) -> $($script:Opt.StopAt.ToString('yyyy-MM-dd hh:mm:ss tt')))" }
     if ($script:Opt.JobName -ne $g.JobName) { $changed += "job name" }
+    if ($script:Opt.NotifyEmail -ne $g.NotifyEmail -or $script:Opt.NotifyOperator -ne $g.NotifyOperator -or $script:Opt.NotifyOnSuccess -ne $g.NotifyOnSuccess -or $script:Opt.NotifyOnFailure -ne $g.NotifyOnFailure) { $changed += 'notification settings' }
     if ($script:Opt.JobRunAt -ne $g.JobRunAt -or $script:Opt.NoSchedule -ne $g.NoSchedule) { $changed += 'job schedule' }
     if ($script:Opt.WithRecovery -ne $g.WithRecovery -or $script:Opt.Replace -ne $g.Replace) { $changed += 'RECOVERY/REPLACE option' }
     if ($changed.Count) { throw ("Options changed after the scripts were generated: " + ($changed -join '; ') + ". Click 'Generate scripts' again (and Build chain first if STOPAT or the database changed), then create the job.") }
@@ -2237,6 +2434,7 @@ function Read-Settings {
         Recent = @(); InvPreset = 0; InvServer = ''; InvAuth = 'Windows'; InvUser = ''; InvDatabase = 'DBA'; InvQuery = $script:DefaultInvQuery
         InvServers = @(); InvLoadedAt = ''; LastSource = ''; LastSourceAuth = 'Windows'; LastSourceUser = ''
         LastDest = ''; LastDestAuth = 'Windows'; LastDestUser = ''; OutRoot = ''; StageRoot = ''; DestCertDir = ''
+        NotifyEmail = ''; NotifyOperator = ''; NotifyOnSuccess = $true; NotifyOnFailure = $true
     }
     if (Test-Path -LiteralPath $script:SettingsFile) {
         try {
@@ -2382,6 +2580,7 @@ $form.Add_FormClosing({
     $s.LastSource = $txtSrc.Text.Trim(); $s.LastSourceAuth = $cboSrcAuth.Text; $s.LastSourceUser = $txtSrcUser.Text
     $s.LastDest = $txtDst.Text.Trim(); $s.LastDestAuth = $cboDstAuth.Text; $s.LastDestUser = $txtDstUser.Text
     $s.OutRoot = $txtOut.Text.Trim(); $s.StageRoot = $txtStage.Text.Trim(); $s.DestCertDir = $txtDestCert.Text.Trim()
+    $s.NotifyEmail = $txtNotifyEmail.Text.Trim(); $s.NotifyOperator = $cboOperator.Text.Trim(); $s.NotifyOnSuccess = $chkNotifyOk.Checked; $s.NotifyOnFailure = $chkNotifyFail.Checked
     $s.InvPreset = $cboInvPreset.SelectedIndex; $s.InvServer = $txtInvServer.Text.Trim(); $s.InvAuth = $cboInvAuth.Text
     $s.InvUser = $txtInvUser.Text; $s.InvDatabase = $txtInvDb.Text.Trim(); $s.InvQuery = $script:InvQueryText
     Save-Settings
@@ -2400,6 +2599,9 @@ $txtDst.Text = $st.LastDest; $cboDstAuth.SelectedItem = $st.LastDestAuth; $txtDs
 if ($st.OutRoot) { $txtOut.Text = $st.OutRoot }
 if ($st.StageRoot) { $txtStage.Text = $st.StageRoot }
 if ($st.DestCertDir) { $txtDestCert.Text = $st.DestCertDir }
+$txtNotifyEmail.Text = [string]$st.NotifyEmail
+if ($st.NotifyOperator) { $cboOperator.Text = [string]$st.NotifyOperator }
+$chkNotifyOk.Checked = [bool]$st.NotifyOnSuccess; $chkNotifyFail.Checked = [bool]$st.NotifyOnFailure
 $script:LoadingSettings = $false
 Update-ServerLists
 
