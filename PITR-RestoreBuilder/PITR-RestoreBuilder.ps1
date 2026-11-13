@@ -32,7 +32,7 @@
 
 $ErrorActionPreference = 'Stop'
 $script:AppName = 'PITR Restore Builder'
-$script:Version = '1.8.1'
+$script:Version = '1.9'
 
 #region ============================ general helpers ============================
 
@@ -1142,6 +1142,7 @@ function New-Banner {
     $mem = [math]::Round($o.BufferCount * [double]$o.MaxTransfer / 1MB)
 @"
 /* ==========================================================================================
+   $script:AppName v$script:Version
    $Title
    Generated   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME ($script:AppName $script:Version)
    Source      : $($script:State.Source.ServerName)  database [$($o.Db)]   (from msdb history)
@@ -1156,8 +1157,7 @@ function New-Banner {
 "@
 }
 
-# One T-SQL block per backup type: FULL, DIFF, and ALL logs together. Restores run in order inside the block
-# and stop at the first failure, naming the backup that failed. -Ssms also stops the remaining SSMS batches.
+# One T-SQL block per backup type: FULL, DIFF, and ALL logs together - just the RESTORE statements, in order.
 function Get-RestoreGroups {
     param($Statements, [switch]$Ssms)
     $groups = New-Object System.Collections.Generic.List[object]
@@ -1172,22 +1172,11 @@ function Get-RestoreGroups {
         if ($grp.Count -gt 1) { $span += ' -> ' + ($last.Print -replace '^.*\((.*)\)$', '$1') }
         $nm = '{0:00} {1} x {2} ({3})' -f $no, $t, $grp.Count, $span
         $cmd = New-Object System.Text.StringBuilder
-        [void]$cmd.AppendLine('SET NOCOUNT ON;')
-        [void]$cmd.AppendLine("DECLARE @step nvarchar(400) = N'';")
-        [void]$cmd.AppendLine('BEGIN TRY')
+        [void]$cmd.AppendLine("-- $script:AppName v$script:Version : $t x $($grp.Count)")
         foreach ($st in $grp) {
-            $lbl = $st.Print.Replace('%', '%%')
-            [void]$cmd.AppendLine('')
-            [void]$cmd.AppendLine($st.Header)
-            [void]$cmd.AppendLine("    SET @step = $(QS $lbl); RAISERROR(@step, 0, 1) WITH NOWAIT;")
             [void]$cmd.AppendLine($st.Sql)
+            [void]$cmd.AppendLine('')
         }
-        [void]$cmd.AppendLine('END TRY')
-        [void]$cmd.AppendLine('BEGIN CATCH')
-        [void]$cmd.AppendLine("    DECLARE @err nvarchar(4000) = N'Failed at ' + @step + N': Msg ' + CAST(ERROR_NUMBER() AS nvarchar(10)) + N' - ' + ERROR_MESSAGE() + N' (full detail, e.g. OS error, is in the SQL Server error log)';")
-        [void]$cmd.AppendLine('    RAISERROR(@err, 16, 1);')
-        if ($Ssms) { [void]$cmd.AppendLine('    SET NOEXEC ON;   -- stop the remaining batches') }
-        [void]$cmd.AppendLine('END CATCH')
         $groups.Add([pscustomobject]@{ Type = $t; Count = $grp.Count; Name = $nm; Cmd = $cmd.ToString() })
     }
     return $groups
@@ -1221,7 +1210,7 @@ function New-SsmsScript {
     foreach ($g in (Get-RestoreGroups $Statements -Ssms)) {
         [void]$sb.AppendLine('')
         [void]$sb.AppendLine('-- ' + ('=' * 100))
-        [void]$sb.AppendLine("-- $($g.Name): one batch for all $($g.Count) $($g.Type) restore(s); stops at the first failure")
+        [void]$sb.AppendLine("-- $($g.Name)")
         [void]$sb.AppendLine('-- ' + ('=' * 100))
         [void]$sb.Append($g.Cmd)
         [void]$sb.AppendLine('GO')
@@ -1249,6 +1238,7 @@ function New-JobScript {
         if ($outFile.Length -gt 200) { $outFile = $null }
     }
     $guard = New-Object System.Text.StringBuilder
+    [void]$guard.AppendLine("-- $script:AppName v$script:Version : safety checks")
     [void]$guard.AppendLine('SET NOCOUNT ON;')
     $srvMsg = ("Wrong server %s - this job was generated for {0}." -f $d.ServerName).Replace('%s', '#S#').Replace('%', '%%').Replace('#S#', '%s')
     [void]$guard.AppendLine("IF @@SERVERNAME <> $(QS $d.ServerName) BEGIN RAISERROR($(QS $srvMsg), 16, 1, @@SERVERNAME); RETURN; END")
@@ -1310,8 +1300,8 @@ function New-JobScript {
     [void]$sb.AppendLine((New-Banner "SQL AGENT JOB '$JobName' (run on the DESTINATION)"))
     if ($o.NoSchedule) { [void]$sb.AppendLine('-- No schedule: start it with sp_start_job (bottom of this script).') }
     else { [void]$sb.AppendLine("-- One-time schedule: $($o.JobRunAt.ToString('yyyy-MM-dd HH:mm:ss')) DESTINATION server local time.") }
-    [void]$sb.AppendLine('-- ONE job step per backup type: FULL, DIFF, and ALL log backups together in a single step. Inside a step the restores run in order and stop at the first failure,')
-    [void]$sb.AppendLine('-- reporting which backup failed. A failed step quits the job.')
+    [void]$sb.AppendLine('-- ONE job step per backup type: FULL, DIFF, and ALL log backups together in a single step (plain RESTORE statements, in order).')
+    [void]$sb.AppendLine('-- If a RESTORE fails, the step fails and the job stops there; the SQL Server error log has the detail.')
     if ($o.NotifyEmail) { [void]$sb.AppendLine("-- E-mail ($(if ($o.NotifyOnSuccess) { 'success ' })$(if ($o.NotifyOnFailure) { 'failure' })) to $($o.NotifyEmail) via Database Mail; profile = default profile, else the first one, picked when the job runs.") }
     if ($level -gt 0) { [void]$sb.AppendLine("-- SQL Agent operator [$($o.NotifyOperator)] notified on $(@{1='success';2='failure';3='success and failure'}[$level]) (needs a mail profile in SQL Agent > Properties > Alert System).") }
     [void]$sb.AppendLine('SET NOCOUNT ON;')
