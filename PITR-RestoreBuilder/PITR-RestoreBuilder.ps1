@@ -32,7 +32,7 @@
 
 $ErrorActionPreference = 'Stop'
 $script:AppName = 'PITR Restore Builder'
-$script:Version = '1.8'
+$script:Version = '1.8.1'
 
 #region ============================ general helpers ============================
 
@@ -1093,6 +1093,8 @@ function New-RestoreStatements {
     param($Chain, $Moves, $Opt)
     $list = New-Object System.Collections.Generic.List[object]
     $n = $Chain.Sets.Count; $i = 0
+    $typeTotal = @{}; $typeIdx = @{}
+    foreach ($x in $Chain.Sets) { if ($typeTotal.ContainsKey($x.Type)) { $typeTotal[$x.Type]++ } else { $typeTotal[$x.Type] = 1; $typeIdx[$x.Type] = 0 } }
     foreach ($s in $Chain.Sets) {
         $i++
         $kw = if ($s.Type -eq 'LOG') { 'LOG' } else { 'DATABASE' }
@@ -1111,12 +1113,14 @@ function New-RestoreStatements {
         $items.Add([pscustomobject]@{ Text = "MAXTRANSFERSIZE = $($Opt.MaxTransfer)"; Comment = '' })
 
         $copy = if ($s.IsCopyOnly) { ' COPY_ONLY' } else { '' }
-        $header = "-- Step $i/$n : $($s.Type)$copy  backup_set_id=$($s.Id)  finished $($s.Finish.ToString('yyyy-MM-dd HH:mm:ss'))  LSN $($s.FirstLsn) -> $($s.LastLsn)  ($($s.SizeMB) MB)"
+        $typeIdx[$s.Type]++
+        $tk = "$($s.Type) $($typeIdx[$s.Type]) of $($typeTotal[$s.Type])"
+        $header = "-- $tk$copy :  backup_set_id=$($s.Id)  finished $($s.Finish.ToString('yyyy-MM-dd HH:mm:ss'))  LSN $($s.FirstLsn) -> $($s.LastLsn)  ($($s.SizeMB) MB)"
         foreach ($dev in $s.Devices) { $r = Resolve-BackupPath $dev $Opt; if ($r.Path -ne $r.Original) { $header += "`r`n--   msdb path: $($r.Original)  ->  read from: $($r.Path)" } }
         $sql = "RESTORE $kw $(QN $Opt.Target)`r`nFROM $(Get-FromClause $s $Opt)`r`nWITH`r`n$(Join-WithItems $items);"
         $list.Add([pscustomobject]@{
             Header = $header; Sql = $sql; Type = $s.Type
-            Print = "Step $i/$n $($s.Type) id $($s.Id) ($($s.Finish.ToString('yyyy-MM-dd HH:mm:ss')))"
+            Print = "$tk - id $($s.Id) ($($s.Finish.ToString('yyyy-MM-dd HH:mm:ss')))"
             StepName = ('{0:00} {1} {2:yyyy-MM-dd HH:mm} id {3}' -f $i, $s.Type, $s.Finish, $s.Id)
         })
     }
@@ -1152,6 +1156,43 @@ function New-Banner {
 "@
 }
 
+# One T-SQL block per backup type: FULL, DIFF, and ALL logs together. Restores run in order inside the block
+# and stop at the first failure, naming the backup that failed. -Ssms also stops the remaining SSMS batches.
+function Get-RestoreGroups {
+    param($Statements, [switch]$Ssms)
+    $groups = New-Object System.Collections.Generic.List[object]
+    $no = 0
+    foreach ($t in 'FULL', 'DIFF', 'LOG') {
+        $grp = New-Object System.Collections.Generic.List[object]
+        foreach ($st in $Statements) { if ($st.Type -eq $t) { $grp.Add($st) } }
+        if ($grp.Count -eq 0) { continue }
+        $no++
+        $first = $grp[0]; $last = $grp[$grp.Count - 1]
+        $span = ($first.Print -replace '^.*\((.*)\)$', '$1')
+        if ($grp.Count -gt 1) { $span += ' -> ' + ($last.Print -replace '^.*\((.*)\)$', '$1') }
+        $nm = '{0:00} {1} x {2} ({3})' -f $no, $t, $grp.Count, $span
+        $cmd = New-Object System.Text.StringBuilder
+        [void]$cmd.AppendLine('SET NOCOUNT ON;')
+        [void]$cmd.AppendLine("DECLARE @step nvarchar(400) = N'';")
+        [void]$cmd.AppendLine('BEGIN TRY')
+        foreach ($st in $grp) {
+            $lbl = $st.Print.Replace('%', '%%')
+            [void]$cmd.AppendLine('')
+            [void]$cmd.AppendLine($st.Header)
+            [void]$cmd.AppendLine("    SET @step = $(QS $lbl); RAISERROR(@step, 0, 1) WITH NOWAIT;")
+            [void]$cmd.AppendLine($st.Sql)
+        }
+        [void]$cmd.AppendLine('END TRY')
+        [void]$cmd.AppendLine('BEGIN CATCH')
+        [void]$cmd.AppendLine("    DECLARE @err nvarchar(4000) = N'Failed at ' + @step + N': Msg ' + CAST(ERROR_NUMBER() AS nvarchar(10)) + N' - ' + ERROR_MESSAGE() + N' (full detail, e.g. OS error, is in the SQL Server error log)';")
+        [void]$cmd.AppendLine('    RAISERROR(@err, 16, 1);')
+        if ($Ssms) { [void]$cmd.AppendLine('    SET NOEXEC ON;   -- stop the remaining batches') }
+        [void]$cmd.AppendLine('END CATCH')
+        $groups.Add([pscustomobject]@{ Type = $t; Count = $grp.Count; Name = $nm; Cmd = $cmd.ToString() })
+    }
+    return $groups
+}
+
 function New-SsmsScript {
     param($Statements)
     $o = $script:Opt; $d = $script:State.Dest
@@ -1177,11 +1218,12 @@ function New-SsmsScript {
         [void]$sb.AppendLine("-- ALTER DATABASE $(QN $o.Target) SET SINGLE_USER WITH ROLLBACK IMMEDIATE;")
         [void]$sb.AppendLine('GO')
     }
-    foreach ($s in $Statements) {
+    foreach ($g in (Get-RestoreGroups $Statements -Ssms)) {
         [void]$sb.AppendLine('')
-        [void]$sb.AppendLine($s.Header)
-        [void]$sb.AppendLine("PRINT $(QS $s.Print);")
-        [void]$sb.AppendLine($s.Sql)
+        [void]$sb.AppendLine('-- ' + ('=' * 100))
+        [void]$sb.AppendLine("-- $($g.Name): one batch for all $($g.Count) $($g.Type) restore(s); stops at the first failure")
+        [void]$sb.AppendLine('-- ' + ('=' * 100))
+        [void]$sb.Append($g.Cmd)
         [void]$sb.AppendLine('GO')
     }
     [void]$sb.AppendLine('')
@@ -1223,32 +1265,7 @@ function New-JobScript {
     $steps = New-Object System.Collections.Generic.List[object]
     $steps.Add([pscustomobject]@{ Name = '00 Safety checks'; Cmd = $guard.ToString() })
     $stepNo = 0
-    foreach ($t in 'FULL', 'DIFF', 'LOG') {
-        $grp = New-Object System.Collections.Generic.List[object]
-        foreach ($st in $Statements) { if ($st.Type -eq $t) { $grp.Add($st) } }
-        if ($grp.Count -eq 0) { continue }
-        $stepNo++
-        $cmd = New-Object System.Text.StringBuilder
-        [void]$cmd.AppendLine('SET NOCOUNT ON;')
-        [void]$cmd.AppendLine("DECLARE @step nvarchar(400) = N'';")
-        [void]$cmd.AppendLine('BEGIN TRY')
-        foreach ($st in $grp) {
-            $lbl = $st.Print.Replace('%', '%%')
-            [void]$cmd.AppendLine('')
-            [void]$cmd.AppendLine($st.Header)
-            [void]$cmd.AppendLine("    SET @step = $(QS $lbl); RAISERROR(@step, 0, 1) WITH NOWAIT;")
-            [void]$cmd.AppendLine($st.Sql)
-        }
-        [void]$cmd.AppendLine('END TRY')
-        [void]$cmd.AppendLine('BEGIN CATCH')
-        [void]$cmd.AppendLine("    DECLARE @err nvarchar(4000) = N'Failed at ' + @step + N': Msg ' + CAST(ERROR_NUMBER() AS nvarchar(10)) + N' - ' + ERROR_MESSAGE() + N' (full detail, e.g. OS error, is in the SQL Server error log)';")
-        [void]$cmd.AppendLine('    RAISERROR(@err, 16, 1);')
-        [void]$cmd.AppendLine('END CATCH')
-        $first = $grp[0]; $last = $grp[$grp.Count - 1]
-        if ($t -eq 'LOG') { $nm = '{0:00} LOG x {1} ({2} -> {3})' -f $stepNo, $grp.Count, ($first.Print -replace '^.*\((.*)\)$', '$1'), ($last.Print -replace '^.*\((.*)\)$', '$1') }
-        else { $nm = '{0:00} {1} - {2}' -f $stepNo, $t, ($first.Print -replace '^Step \d+/\d+ ', '') }
-        $steps.Add([pscustomobject]@{ Name = $nm; Cmd = $cmd.ToString() })
-    }
+    foreach ($g in (Get-RestoreGroups $Statements)) { $stepNo++; $steps.Add([pscustomobject]@{ Name = $g.Name; Cmd = $g.Cmd }) }
     if ($o.WithRecovery) { $stepNo++; $steps.Add([pscustomobject]@{ Name = ('{0:00} WITH RECOVERY' -f $stepNo); Cmd = "RESTORE DATABASE $(QN $o.Target) WITH RECOVERY;" }) }
 
     # ---- optional e-mail steps (Database Mail; profile chosen when the job runs) ----
@@ -1293,7 +1310,7 @@ function New-JobScript {
     [void]$sb.AppendLine((New-Banner "SQL AGENT JOB '$JobName' (run on the DESTINATION)"))
     if ($o.NoSchedule) { [void]$sb.AppendLine('-- No schedule: start it with sp_start_job (bottom of this script).') }
     else { [void]$sb.AppendLine("-- One-time schedule: $($o.JobRunAt.ToString('yyyy-MM-dd HH:mm:ss')) DESTINATION server local time.") }
-    [void]$sb.AppendLine('-- One job step per backup type (FULL / DIFF / all LOGs). Inside a step the restores run in order and stop at the first failure,')
+    [void]$sb.AppendLine('-- ONE job step per backup type: FULL, DIFF, and ALL log backups together in a single step. Inside a step the restores run in order and stop at the first failure,')
     [void]$sb.AppendLine('-- reporting which backup failed. A failed step quits the job.')
     if ($o.NotifyEmail) { [void]$sb.AppendLine("-- E-mail ($(if ($o.NotifyOnSuccess) { 'success ' })$(if ($o.NotifyOnFailure) { 'failure' })) to $($o.NotifyEmail) via Database Mail; profile = default profile, else the first one, picked when the job runs.") }
     if ($level -gt 0) { [void]$sb.AppendLine("-- SQL Agent operator [$($o.NotifyOperator)] notified on $(@{1='success';2='failure';3='success and failure'}[$level]) (needs a mail profile in SQL Agent > Properties > Alert System).") }
