@@ -63,6 +63,7 @@ For example, the FULL was restored yesterday WITH NORECOVERY and you now want to
 - The tool reads where that database is now from the destination, without changing it: `redo_start_lsn` and `differential_base_lsn` in `sys.master_files`, plus `restorehistory`. It then builds the chain from that point using the source msdb.
 - No FULL and no `MOVE` are included, because the files already exist.
 - The script and the job refuse to run if the database is no longer RESTORING.
+- **FULL still restoring?** You don't have to wait. SQL Server only records the next-restore point when a RESTORE finishes. The tool therefore finds the running RESTORE on the target (percent done, time left), identifies which FULL/DIFF it is using (from this tool's step comments, or by file name), and plans the DIFF and logs from that backup. The continue script and job **wait** (up to 48 hours, checking every minute) until the running restore has finished, then check that the database is RESTORING and carry on. Seeing another session's restore needs VIEW SERVER STATE. The job runs as the SQL Agent service account, which has it.
 
 ## Backup paths and shares
 msdb stores backup paths as the source server saw them, for example `C:\Apps\BKUP\...`. From another server that path points at the destination's own C: drive. When **Convert local paths** is ticked (the default):
@@ -83,6 +84,12 @@ These only run when **Allow execution** is ticked, and each one lists what it wi
   - `CREATE MASTER KEY` (if missing) and `CREATE CERTIFICATE` on the destination
   - the share is removed afterwards. The certificate **and private key** files stay on disk; move them somewhere safe and delete them.
 - Create the SQL Agent job, and optionally start it. The tool refuses if options changed after the scripts were generated.
+
+## Job notifications (tab 3)
+- **E-mail to** (one or more addresses, separated by `;`): the job gets a **Notify: succeeded** and/or **Notify: failed** step that sends through Database Mail. The **profile is chosen when the job runs**: the default profile, else the first one. The failure e-mail names the step that failed and its error message. The job still ends as FAILED, and a mail problem never turns a successful restore into a failed job.
+- **Operator:** **Load operators** lists the destination's enabled SQL Agent operators. The job's built-in notification (`@notify_level_email` on success and/or failure) uses it. This needs a mail profile set in SQL Agent > Properties > Alert System.
+- **On success / On failure** choose which events notify. All of these are remembered on this PC.
+- Preflight checks that Database Mail XPs is on, that a profile exists and which profile would be used, that the operator exists and has an e-mail address, and that SQL Agent has a mail profile.
 
 ## Server lists and cache (tab 1)
 - **Server list from** defaults to the machine the tool runs on. Load the list from your own inventory table (first column = server name) or from a Central Management Server.
