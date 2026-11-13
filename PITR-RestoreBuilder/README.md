@@ -16,7 +16,7 @@ A WinForms GUI that builds a **point-in-time restore** of a SQL Server database 
   ```
 
 ## How it works
-1. **Build chain** (source, reads msdb only). Picks the latest FULL that finished before STOPAT, then the DIFF based on that FULL, then the log backups up to and including the first log that ends after STOPAT, all linked by LSN. Stops with a clear message on a broken log chain, a recovery fork, damaged or snapshot backups, or a STOPAT that no log reaches. Modes: Auto, FULL only, FULL + DIFF, FULL + DIFF + LOG.
+1. **Build chain** (source, reads msdb only). Picks the latest FULL that finished before STOPAT, then the DIFF based on that FULL, then the log backups up to and including the first log that ends after STOPAT, all linked by LSN. Stops with a clear message on a broken log chain, a recovery fork, damaged or snapshot backups, or a STOPAT that no log reaches. Modes: Auto, FULL only, FULL + DIFF, FULL + DIFF + LOG, plus three **Continue** modes for a restore already in progress (see below).
 2. **Preflight** (destination, read-only). Runs `RESTORE HEADERONLY` on every backup file and checks that the LSNs match msdb, so overwritten or missing files are caught. Also checks `FILELISTONLY`, the SQL Server version, permissions, whether the target database exists or is in an AG, blob credentials, TDE and backup-encryption certificates, target folders, disk space, restore buffer memory and SQL Agent. Each failure says why and how to fix it.
 3. **Generate scripts.** Writes these files to the output folder:
 
@@ -37,12 +37,32 @@ A WinForms GUI that builds a **point-in-time restore** of a SQL Server database 
 - BUFFERCOUNT 450 × 4 MB is about 1.8 GB of memory outside the buffer pool. Preflight warns when that is more than 25% of the destination's free memory.
 
 ## WITH MOVE
-The **Auto** strategy picks destination folders in this order:
-1. a destination database whose name contains your pattern
-2. the folder most user databases use
-3. the instance default paths
+Strategies:
+- **Auto** picks destination folders in this order:
+  1. a destination database whose name contains your pattern
+  2. the folder most user databases use
+  3. the instance default paths
+- **Largest free disk:** the drive or mount point with the most free space, using a folder on it that user databases already use. If no such folder exists, it uses the drive root and the comment asks you to pick a subfolder.
+- **Manual:** the folders you enter.
+- **Instance default:** the instance's default data and log paths.
+
+**Browse the destination disks.** The `...` button next to the Data (MDF), NDF and Log (LDF) boxes opens the destination's drives and mount points with free and total space. Expand them to choose a folder. The listing shows what the **destination SQL Server service account** can see (read-only: `sys.dm_os_enumerate_fixed_drives` / `dm_os_volume_stats`, and `xp_dirtree` for folders, which needs sysadmin). **Set folder for selected rows** applies a chosen folder to the selected files in the MOVE grid. The folder must already exist, because RESTORE does not create folders.
 
 Folders you type in always win. Each `MOVE` line carries a `-- REVIEW` comment saying where the folder came from. You can edit any target path in the grid on tab 2.
+
+## Continue a restore in progress (DIFF and/or LOG only)
+For example, the FULL was restored yesterday WITH NORECOVERY and you now want to apply the DIFF and logs. Pick one of these modes on tab 1:
+
+| Mode | Restores |
+|---|---|
+| Continue: DIFF only | the newest DIFF on the FULL that is already restored |
+| Continue: DIFF + LOGs | that DIFF (if one is newer than where the database is), then the logs up to STOPAT |
+| Continue: LOGs only | the logs from where the database is now, up to STOPAT |
+
+- **Restoring DBs...** lists the destination's databases that are in RESTORING state, with their last restore. Pick the one to continue.
+- The tool reads where that database is now from the destination, without changing it: `redo_start_lsn` and `differential_base_lsn` in `sys.master_files`, plus `restorehistory`. It then builds the chain from that point using the source msdb.
+- No FULL and no `MOVE` are included, because the files already exist.
+- The script and the job refuse to run if the database is no longer RESTORING.
 
 ## Backup paths and shares
 msdb stores backup paths as the source server saw them, for example `C:\Apps\BKUP\...`. From another server that path points at the destination's own C: drive. When **Convert local paths** is ticked (the default):
