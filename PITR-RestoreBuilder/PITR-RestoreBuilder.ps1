@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+# PITR Restore Builder  version 1.9  (tool version - also shown in the title bar and at the top of every generated script)
 <#
 .SYNOPSIS
     PITR Restore Builder - WinForms GUI that builds a FULL / FULL+DIFF / FULL+DIFF+LOG (STOPAT)
@@ -23,6 +24,7 @@
       - Create (and optionally start) the SQL Agent job that runs the restore. Owner = sa (SUSER_SNAME(0x01)).
 
 .NOTES
+    Version 1.9
     Windows PowerShell 5.1, no modules needed (System.Data.SqlClient + WinForms).
     STOPAT is in the SOURCE server's local time: msdb and the transaction log record source local time.
     Run   : powershell.exe -ExecutionPolicy Bypass -File .\PITR-RestoreBuilder.ps1
