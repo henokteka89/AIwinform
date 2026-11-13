@@ -22,8 +22,8 @@ A WinForms GUI that builds a **point-in-time restore** of a SQL Server database 
 
 | File | Purpose |
 |---|---|
-| `01_restore.sql` | Restore script for SSMS with the same layout as the job: **one batch per backup type**, with all log backups in a single batch. It stops at the first failure, and a guard at the top checks it is running on the right server and that the target database doesn't already exist |
-| `02_create_sql_agent_job.sql` | SQL Agent job, owner `sa`, one-time schedule. **One step per backup type:** FULL, DIFF, all LOGs, then RECOVERY if chosen |
+| `01_restore.sql` | Restore script for SSMS with the same layout as the job: **one batch per backup type**, with all log backups in a single batch of plain `RESTORE LOG ... FROM DISK/URL` statements. The tool version is on the first line, and a guard at the top checks it is running on the right server and that the target database doesn't already exist |
+| `02_create_sql_agent_job.sql` | SQL Agent job, owner `sa`, one-time schedule. **One step per backup type:** FULL, DIFF, ALL LOGs in a single step (plain RESTORE statements), then RECOVERY if chosen. Each step starts with the tool version |
 | `03_tde_certificate_transfer.sql` | Manual certificate backup and restore steps (only when needed) |
 | `04_blob_credential.sql` | SAS credential for the blob container (only when restoring from URL) |
 | `05_azcopy_to_blob.ps1` | Copies the backups to blob storage when the destination can't reach the share (DMZ to Azure, for example) |
