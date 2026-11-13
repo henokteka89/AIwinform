@@ -22,7 +22,7 @@ A WinForms GUI that builds a **point-in-time restore** of a SQL Server database 
 
 | File | Purpose |
 |---|---|
-| `01_restore.sql` | Restore script for SSMS: one `GO` batch per restore, plus a wrong-server / existing-database guard |
+| `01_restore.sql` | Restore script for SSMS with the same layout as the job: **one batch per backup type**, with all log backups in a single batch. It stops at the first failure, and a guard at the top checks it is running on the right server and that the target database doesn't already exist |
 | `02_create_sql_agent_job.sql` | SQL Agent job, owner `sa`, one-time schedule. **One step per backup type:** FULL, DIFF, all LOGs, then RECOVERY if chosen |
 | `03_tde_certificate_transfer.sql` | Manual certificate backup and restore steps (only when needed) |
 | `04_blob_credential.sql` | SAS credential for the blob container (only when restoring from URL) |
