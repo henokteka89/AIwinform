@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# PITR Restore Builder  version 1.9  (tool version - also shown in the title bar and at the top of every generated script)
+# PITR Restore Builder  version 1.9.1  (tool version - also shown in the title bar and at the top of every generated script)
 <#
 .SYNOPSIS
     PITR Restore Builder - WinForms GUI that builds a FULL / FULL+DIFF / FULL+DIFF+LOG (STOPAT)
@@ -24,7 +24,7 @@
       - Create (and optionally start) the SQL Agent job that runs the restore. Owner = sa (SUSER_SNAME(0x01)).
 
 .NOTES
-    Version 1.9
+    Version 1.9.1
     Windows PowerShell 5.1, no modules needed (System.Data.SqlClient + WinForms).
     STOPAT is in the SOURCE server's local time: msdb and the transaction log record source local time.
     Run   : powershell.exe -ExecutionPolicy Bypass -File .\PITR-RestoreBuilder.ps1
@@ -34,7 +34,7 @@
 
 $ErrorActionPreference = 'Stop'
 $script:AppName = 'PITR Restore Builder'
-$script:Version = '1.9'
+$script:Version = '1.9.1'
 
 #region ============================ general helpers ============================
 
@@ -1100,8 +1100,9 @@ function New-RestoreStatements {
     foreach ($s in $Chain.Sets) {
         $i++
         $kw = if ($s.Type -eq 'LOG') { 'LOG' } else { 'DATABASE' }
+        $isLog = ($s.Type -eq 'LOG')
         $items = New-Object System.Collections.Generic.List[object]
-        $items.Add([pscustomobject]@{ Text = "FILE = $($s.Position)"; Comment = '' })
+        if (-not $isLog -or $s.Position -ne 1) { $items.Add([pscustomobject]@{ Text = "FILE = $($s.Position)"; Comment = '' }) }
         if ($s.Type -eq 'FULL') {
             foreach ($m in $Moves) { $items.Add([pscustomobject]@{ Text = "MOVE $(QS $m.LogicalName) TO $(QS $m.TargetPath)"; Comment = "$($m.Kind): $($m.Comment)" }) }
             if ($Opt.Replace) { $items.Add([pscustomobject]@{ Text = 'REPLACE'; Comment = 'overwrites the existing database' }) }
@@ -1110,16 +1111,24 @@ function New-RestoreStatements {
         if ($s.Type -eq 'LOG' -and $i -eq $n -and $Chain.UsesStopAt) {
             $items.Add([pscustomobject]@{ Text = "STOPAT = N'$($Chain.StopAt.ToString('yyyy-MM-ddTHH:mm:ss.fff'))'"; Comment = 'source server local time' })
         }
-        $items.Add([pscustomobject]@{ Text = "STATS = $($Opt.Stats)"; Comment = '' })
-        $items.Add([pscustomobject]@{ Text = "BUFFERCOUNT = $($Opt.BufferCount)"; Comment = '' })
-        $items.Add([pscustomobject]@{ Text = "MAXTRANSFERSIZE = $($Opt.MaxTransfer)"; Comment = '' })
+        if (-not $isLog) {   # tuning options only where they matter (FULL / DIFF); log restores stay minimal
+            $items.Add([pscustomobject]@{ Text = "STATS = $($Opt.Stats)"; Comment = '' })
+            $items.Add([pscustomobject]@{ Text = "BUFFERCOUNT = $($Opt.BufferCount)"; Comment = '' })
+            $items.Add([pscustomobject]@{ Text = "MAXTRANSFERSIZE = $($Opt.MaxTransfer)"; Comment = '' })
+        }
 
         $copy = if ($s.IsCopyOnly) { ' COPY_ONLY' } else { '' }
         $typeIdx[$s.Type]++
         $tk = "$($s.Type) $($typeIdx[$s.Type]) of $($typeTotal[$s.Type])"
         $header = "-- $tk$copy :  backup_set_id=$($s.Id)  finished $($s.Finish.ToString('yyyy-MM-dd HH:mm:ss'))  LSN $($s.FirstLsn) -> $($s.LastLsn)  ($($s.SizeMB) MB)"
         foreach ($dev in $s.Devices) { $r = Resolve-BackupPath $dev $Opt; if ($r.Path -ne $r.Original) { $header += "`r`n--   msdb path: $($r.Original)  ->  read from: $($r.Path)" } }
-        $sql = "RESTORE $kw $(QN $Opt.Target)`r`nFROM $(Get-FromClause $s $Opt)`r`nWITH`r`n$(Join-WithItems $items);"
+        if ($isLog) {
+            # one line: RESTORE LOG [db] FROM DISK = N'...' WITH NORECOVERY;   (stripes: DISK = N'...', DISK = N'...')
+            $from = (@($s.Devices | ForEach-Object { $r = Resolve-BackupPath $_ $Opt; "$($r.Kind) = $(QS $r.Path)" })) -join ', '
+            $sql = "RESTORE LOG $(QN $Opt.Target) FROM $from WITH " + ((@($items | ForEach-Object { $_.Text })) -join ', ') + ';'
+            if ($items | Where-Object { $_.Text -like 'STOPAT*' }) { $sql += '   -- STOPAT is source server local time' }
+        }
+        else { $sql = "RESTORE $kw $(QN $Opt.Target)`r`nFROM $(Get-FromClause $s $Opt)`r`nWITH`r`n$(Join-WithItems $items);" }
         $list.Add([pscustomobject]@{
             Header = $header; Sql = $sql; Type = $s.Type
             Print = "$tk - id $($s.Id) ($($s.Finish.ToString('yyyy-MM-dd HH:mm:ss')))"
@@ -1152,7 +1161,7 @@ function New-Banner {
    Mode        : $($c.Mode)   chain: $counts
    STOPAT      : $stop
    Final state : $final
-   Options     : STATS = $($o.Stats), BUFFERCOUNT = $($o.BufferCount), MAXTRANSFERSIZE = $($o.MaxTransfer) (~$mem MB buffers)$(if ($o.Replace) { ', REPLACE' })
+   Options     : FULL/DIFF: STATS = $($o.Stats), BUFFERCOUNT = $($o.BufferCount), MAXTRANSFERSIZE = $($o.MaxTransfer) (~$mem MB buffers); LOG: NORECOVERY only$(if ($o.Replace) { ', REPLACE' })
    Preflight   : $pf
    REVIEW every MOVE target path before running.
    ========================================================================================== */
@@ -1177,7 +1186,7 @@ function Get-RestoreGroups {
         [void]$cmd.AppendLine("-- $script:AppName v$script:Version : $t x $($grp.Count)")
         foreach ($st in $grp) {
             [void]$cmd.AppendLine($st.Sql)
-            [void]$cmd.AppendLine('')
+            if ($t -ne 'LOG') { [void]$cmd.AppendLine('') }
         }
         $groups.Add([pscustomobject]@{ Type = $t; Count = $grp.Count; Name = $nm; Cmd = $cmd.ToString() })
     }

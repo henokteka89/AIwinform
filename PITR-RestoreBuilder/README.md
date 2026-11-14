@@ -30,7 +30,8 @@ A WinForms GUI that builds a **point-in-time restore** of a SQL Server database 
 | `00_preflight_report.txt`, `chain.csv` | What was checked and which backups were picked |
 
 ## Restore defaults
-- Every step: `WITH FILE = n, NORECOVERY, STATS = 10, BUFFERCOUNT = 450, MAXTRANSFERSIZE = 4194304`. All of these can be changed in the GUI.
+- FULL and DIFF: `WITH FILE = n, NORECOVERY, STATS = 10, BUFFERCOUNT = 450, MAXTRANSFERSIZE = 4194304`. All of these can be changed in the GUI.
+- LOG: one line each, `RESTORE LOG [db] FROM DISK|URL = N'...' WITH NORECOVERY;`. `FILE = n` is added only when the log isn't the first backup in its file, and there are no tuning options.
 - `STOPAT` is added only on the last LOG step, in **source server local time**, which is the time msdb and the transaction log use.
 - `RECOVERY` is used only when you tick it; otherwise the database is left RESTORING. `REPLACE` is used only when you tick it.
 - `CHECKSUM` is not added, on the assumption that backups are already taken WITH CHECKSUM.
